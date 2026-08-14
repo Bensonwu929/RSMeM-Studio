@@ -179,8 +179,8 @@ It does not reproduce the full GPU-backed perception stack or claim to execute
 the complete EarthBench evaluation inside the browser.
             """
         )
-        gr.Image("assets/figure1.png", label="Remote-sensing agent paradigms", show_download_button=False)
-        gr.Image("assets/figure2.png", label="RSMeM workflow", show_download_button=False)
+        gr.Image("assets/figure1.png", label="Remote-sensing agent paradigms")
+        gr.Image("assets/figure2.png", label="RSMeM workflow")
 
     with gr.Tab("Interactive memory demo"):
         gr.Markdown(
