@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
 import gradio as gr
+from openai import OpenAI
 
 
 ROOT = Path(__file__).resolve().parent
@@ -15,6 +17,8 @@ KB_PATH = ROOT / "knowledge_base.json"
 PROJECT_TITLE = "RSMeM: Knowledge-Enhanced Memory Evolution for Remote Sensing Agents"
 GITHUB_URL = "https://github.com/AI9Stars/RSMeM"
 LEARN_URL = "https://modelscope.cn/learn/434564"
+MODELSCOPE_BASE_URL = "https://api-inference.modelscope.cn/v1"
+DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
 
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how",
@@ -116,7 +120,88 @@ def summarize_failure(trajectory: str) -> tuple[str, str]:
     )
 
 
-def run_demo(query: str, trajectory: str):
+def call_rsmem_api(
+    query: str,
+    trajectory: str,
+    retrieved: list[tuple[int, dict]],
+    diagnosis: str,
+    correction: str,
+    user_api_key: str,
+    requested_model: str,
+) -> tuple[str, str]:
+    api_key = (
+        user_api_key.strip()
+        or os.getenv("RSMEM_API_KEY")
+        or os.getenv("MODELSCOPE_API_TOKEN")
+        or os.getenv("DASHSCOPE_API_KEY")
+    )
+    base_url = os.getenv("RSMEM_BASE_URL", MODELSCOPE_BASE_URL).strip()
+    model = requested_model.strip() or os.getenv("RSMEM_MODEL", DEFAULT_MODEL).strip()
+
+    if not api_key:
+        fallback = (
+            "### Offline fallback plan\n"
+            "1. Validate the imagery path, CRS, spatial extent, units, and required parameters.\n"
+            "2. Select the smallest tool sequence supported by the retrieved domain guidance.\n"
+            f"3. Apply the reusable constraint: {correction}\n"
+            "4. Inspect every intermediate observation before continuing downstream.\n"
+            "5. Record failures and corrected strategies for the next attempt."
+        )
+        return fallback, "⚪ Enter your own ModelScope token to enable online reasoning."
+
+    knowledge_context = []
+    for _, entry in retrieved:
+        summary = re.sub(r"\s+", " ", entry["summary"]).strip()[:900]
+        knowledge_context.append(
+            f"Domain: {entry['domain']}\nTask: {entry['application']}\nGuidance: {summary}"
+        )
+
+    system_prompt = """You are the planning and reflection component of RSMeM, a remote-sensing agent.
+Use the retrieved hierarchical domain knowledge and the failure-aware constraint to produce an auditable plan.
+Do not claim that tools or models were actually executed. Do not invent measurements, files, or experimental results.
+Return concise Markdown with exactly these sections: Task interpretation, Retrieved guidance, Corrected execution plan,
+Validation checks, and Memory to retain."""
+    user_prompt = f"""Remote-sensing task:
+{query[:4000]}
+
+Observed failed trajectory:
+{trajectory[:4000] or 'No prior trajectory supplied.'}
+
+Failure diagnosis:
+{diagnosis}
+
+Reusable constraint:
+{correction}
+
+Retrieved knowledge:
+{chr(10).join(knowledge_context)}
+"""
+
+    try:
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=900,
+        )
+        content = response.choices[0].message.content or "The API returned an empty response."
+        return content, f"🟢 Online RSMeM reasoning enabled - model: `{model}`"
+    except Exception as exc:
+        safe_error = type(exc).__name__
+        fallback = (
+            "### API unavailable - safe fallback\n"
+            f"The online request could not be completed (`{safe_error}`). No credential was exposed.\n\n"
+            f"**Reusable constraint:** {correction}\n\n"
+            "Validate inputs and tool contracts, execute the smallest valid step, inspect its observation, and retry."
+        )
+        return fallback, "🟠 API request failed - the Studio remains available in fallback mode."
+
+
+def run_demo(query: str, trajectory: str, user_api_key: str, requested_model: str):
     query = query.strip() or "Map flooded areas after a major storm using satellite imagery."
     retrieved = retrieve_knowledge(query)
     diagnosis, correction = summarize_failure(trajectory)
@@ -135,13 +220,14 @@ def run_demo(query: str, trajectory: str):
         f"**Reusable constraint:** {correction}  \n"
         "**Memory policy:** Preserve the originating trajectory and retrieve this constraint only for similar tasks."
     )
-    prompt = (
-        "### RSMeM planning context\n"
-        f"**User task:** {query}\n\n"
-        f"**Domain grounding:** {retrieved[0][1]['domain']} / {retrieved[0][1]['application']}\n\n"
-        f"**Failure-aware constraint:** {correction}\n\n"
-        "**Next action:** Validate inputs and tool contracts, execute the smallest valid step, inspect the observation, "
-        "then continue the workflow."
+    prompt, api_status = call_rsmem_api(
+        query,
+        trajectory,
+        retrieved,
+        diagnosis,
+        correction,
+        user_api_key,
+        requested_model,
     )
     comparison = (
         "| Agent | Planning context | Failure reuse | Expected behavior |\n"
@@ -149,7 +235,7 @@ def run_demo(query: str, trajectory: str):
         "| Baseline | General LLM prompt | None | May repeat invalid tool calls |\n"
         "| RSMeM | Hierarchical domain guidance | Compact, traceable constraint | More auditable and robust retry |"
     )
-    return hkg, far, prompt, comparison
+    return api_status, hkg, far, prompt, comparison
 
 
 CSS = """
@@ -174,9 +260,9 @@ RSMeM combines **Hierarchical Knowledge Grounding (HKG)** with
 geoscience guidance for planning and tool selection, while FAR converts failed
 tool-use trajectories into compact, reusable constraints.
 
-This public Studio is an **API-free explanatory demo** of the memory workflow.
-It does not reproduce the full GPU-backed perception stack or claim to execute
-the complete EarthBench evaluation inside the browser.
+This public Studio combines deterministic knowledge retrieval with an optional
+OpenAI-compatible LLM API. It does not reproduce the full GPU-backed perception
+stack or claim to execute the complete EarthBench evaluation inside the browser.
             """
         )
         gr.Image("assets/figure1.png", label="Remote-sensing agent paradigms")
@@ -187,6 +273,24 @@ the complete EarthBench evaluation inside the browser.
             "Enter a remote-sensing task and an example failed trajectory. The demo retrieves domain knowledge "
             "and produces a transparent, reusable execution constraint."
         )
+        with gr.Row():
+            api_key_input = gr.Textbox(
+                label="Your ModelScope API token",
+                type="password",
+                placeholder="Enter your token for this request",
+                info="Used only for the inference request; never saved by this application.",
+            )
+            model_input = gr.Dropdown(
+                label="Model",
+                choices=[
+                    "deepseek-ai/DeepSeek-V4-Flash-0731",
+                    "Qwen/Qwen3-235B-A22B-Instruct-2507",
+                    "Qwen/Qwen3-32B",
+                ],
+                value="deepseek-ai/DeepSeek-V4-Flash-0731",
+                allow_custom_value=True,
+                info="Availability depends on your ModelScope account and current inference service.",
+            )
         with gr.Row():
             query_input = gr.Textbox(
                 label="Remote-sensing task",
@@ -199,6 +303,7 @@ the complete EarthBench evaluation inside the browser.
                 lines=3,
             )
         run_button = gr.Button("Run RSMeM memory demonstration", variant="primary")
+        api_status = gr.Markdown("⚪ Ready. Click the button to run the demonstration.")
         with gr.Row():
             hkg_output = gr.Markdown(label="HKG retrieval")
             far_output = gr.Markdown(label="FAR experience")
@@ -206,13 +311,8 @@ the complete EarthBench evaluation inside the browser.
         comparison_output = gr.Markdown(label="Baseline comparison")
         run_button.click(
             run_demo,
-            inputs=[query_input, failure_input],
-            outputs=[hkg_output, far_output, prompt_output, comparison_output],
-        )
-        demo.load(
-            run_demo,
-            inputs=[query_input, failure_input],
-            outputs=[hkg_output, far_output, prompt_output, comparison_output],
+            inputs=[query_input, failure_input, api_key_input, model_input],
+            outputs=[api_status, hkg_output, far_output, prompt_output, comparison_output],
         )
 
     with gr.Tab("Open-source resources"):
