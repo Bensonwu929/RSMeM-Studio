@@ -1,2 +1,4 @@
 gradio==6.17.3
 openai>=1.99,<3
+numpy>=1.26,<3
+rasterio>=1.4,<2

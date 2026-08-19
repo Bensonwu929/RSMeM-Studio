@@ -21,12 +21,12 @@ RSMeM combines Hierarchical Knowledge Grounding (HKG) and Failure-Aware
 Experience Refinement (FAR) to improve the reliability and reproducibility of
 multi-step remote-sensing agents.
 
-This lightweight ModelScope Studio provides a CPU-friendly demonstration of the
-core memory workflow. It retrieves structured domain knowledge, turns an example
-failure trajectory into a transparent reusable constraint, and can call an
-OpenAI-compatible LLM API to generate an auditable corrected plan. The full
-experimental framework and MCP-based remote-sensing tool stack remain available
-in the public source repository.
+This ModelScope Studio provides a CPU-friendly, executable demonstration of the
+core memory workflow. It retrieves structured domain knowledge, plans and runs
+real raster operations, applies a critic, turns failed trajectories into reusable
+constraints, and can call an OpenAI-compatible LLM API for planning/reflection.
+The full experimental framework and MCP tool stack remain available in the
+public source repository.
 
 ## Observable RSMeM loop
 
@@ -35,17 +35,20 @@ framework:
 
 1. Retrieve query-relevant hierarchical knowledge (HKG).
 2. Plan a short remote-sensing tool chain.
-3. Execute the plan and record tool calls, parameters, and observations.
+3. Execute a constrained Index/Statistics tool subset over real GeoTIFF data and
+   record tool calls, parameters, observations, and downloadable artifacts.
 4. Apply a critic to the result.
 5. On failure only, compress the trajectory into a reusable FAR reflection and
    write it to Failure-Aware Memory.
 6. Inject both HKG and the latest reflection into the next attempt, rerun the
    failed task, and stop after success or the attempt limit.
 
-The hosted Studio uses a clearly labelled sandbox executor because the full
-production stack requires external datasets, MCP servers, and GPU perception
-services. It demonstrates state transitions and memory evolution; it does not
-report sandbox observations as real Earth-observation measurements.
+The hosted Studio accepts optional `.tif`/`.tiff` uploads and recognizes common
+band names such as `B4_red`, `B5_nir`, `B6_swir1`, and `B7_swir2`. If no files
+are uploaded, it creates a deterministic synthetic GeoTIFF scene so the whole
+pipeline remains testable. The CPU runtime mirrors selected public RSMeM
+Index/Statistics tool contracts using Rasterio and NumPy. GPU perception tools
+are intentionally disabled on the free CPU instance.
 
 ## API use
 
@@ -82,6 +85,6 @@ python app.py
 
 ## Scope
 
-The Studio is an explanatory artifact for the Open Source GeoAI Practice
-Challenge. It does not claim to run the full GPU perception stack or the
-complete EarthBench evaluation in-browser.
+The Studio is an executable artifact for the Open Source GeoAI Practice
+Challenge. It runs a safe CPU subset of the released tool stack, but does not
+claim to run the GPU perception services or the complete EarthBench evaluation.

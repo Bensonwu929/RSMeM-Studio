@@ -7,11 +7,25 @@ import ipaddress
 import os
 import re
 import socket
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
 import gradio as gr
 from openai import OpenAI
+
+from cpu_tools import (
+    calc_batch_image_mean,
+    calculate_area,
+    calculate_nbr,
+    calculate_ndvi,
+    calculate_ndwi,
+    calculate_threshold_ratio,
+    create_demo_scene,
+    create_threshold_mask,
+    infer_band_roles,
+    inspect_rasters,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -155,15 +169,21 @@ def validate_base_url(value: str) -> str:
 
 
 TOOL_REFERENCE = """
-- get_filelist: always inspect available files and band composition first.
-- calculate_ndwi: delineate water/moisture from suitable Green/NIR or NIR/SWIR bands.
+- inspect_rasters: inspect uploaded GeoTIFF dimensions, CRS, pixel size, and band count.
+- calculate_ndwi: calculate the released RSMeM NIR/SWIR water-moisture index.
 - calculate_ndvi: estimate vegetation greenness from NIR and Red bands.
-- calculate_nbr: assess burned areas from NIR and SWIR bands.
-- split_window: retrieve land-surface temperature when its thermal-band contract is satisfied.
+- calculate_nbr: assess burned areas from NIR and SWIR2 bands.
 - calculate_threshold_ratio: summarize the fraction of raster pixels satisfying a threshold.
 - calc_batch_image_mean: produce one scalar mean per raster/date.
-- calculate_mask_area: convert a validated binary mask into physical area.
+- calculate_area: convert a validated binary mask into physical area.
 """.strip()
+
+SUPPORTED_TOOLS = {
+    "inspect_rasters", "get_filelist", "validate_inputs", "calculate_ndwi",
+    "calculate_ndvi", "calculate_nbr", "calculate_threshold_ratio",
+    "create_threshold_mask", "calculate_area", "calculate_mask_area",
+    "calc_batch_image_mean", "validate_result",
+}
 
 
 def api_completion(
@@ -210,9 +230,9 @@ def fallback_tool_plan(query: str, reflection: str = "") -> list[dict]:
     low = query.lower()
     plan = [
         {
-            "tool": "get_filelist",
-            "purpose": "Inspect actual inputs and band composition before selecting a method.",
-            "parameters": {"data_source": "sandbox/sample_scene"},
+            "tool": "inspect_rasters",
+            "purpose": "Inspect actual GeoTIFF inputs, CRS, resolution, and band composition.",
+            "parameters": {"source": "visitor uploads or bundled CPU demo scene"},
         }
     ]
     if any(term in low for term in ("flood", "water", "inundation")):
@@ -220,8 +240,8 @@ def fallback_tool_plan(query: str, reflection: str = "") -> list[dict]:
             [
                 {
                     "tool": "calculate_ndwi",
-                    "purpose": "Generate a water-sensitive index after confirming band order.",
-                    "parameters": {"bands": "validated Green/NIR or NIR/SWIR pair"},
+                    "purpose": "Generate the released RSMeM NIR/SWIR water-moisture index.",
+                    "parameters": {"bands": "validated NIR/SWIR1 pair"},
                 },
                 {
                     "tool": "calculate_threshold_ratio",
@@ -229,7 +249,7 @@ def fallback_tool_plan(query: str, reflection: str = "") -> list[dict]:
                     "parameters": {"threshold": "validated from metadata"},
                 },
                 {
-                    "tool": "calculate_mask_area",
+                    "tool": "calculate_area",
                     "purpose": "Convert the final water mask into physical area.",
                     "parameters": {"crs": "validated projected CRS"},
                 },
@@ -252,7 +272,7 @@ def fallback_tool_plan(query: str, reflection: str = "") -> list[dict]:
     else:
         plan.extend(
             [
-                {"tool": "domain_analysis", "purpose": "Apply the retrieved domain methodology.", "parameters": {}},
+                {"tool": "calc_batch_image_mean", "purpose": "Summarize the uploaded rasters with CPU statistics.", "parameters": {}},
                 {"tool": "validate_result", "purpose": "Check the output contract before answering.", "parameters": {}},
             ]
         )
@@ -278,9 +298,12 @@ def normalize_plan(data: dict | list | None, query: str, reflection: str) -> lis
         if isinstance(item, str):
             normalized.append({"tool": item, "purpose": "Planned by the agent.", "parameters": {}})
         elif isinstance(item, dict) and item.get("tool"):
+            tool = str(item["tool"])
+            if tool not in SUPPORTED_TOOLS:
+                continue
             normalized.append(
                 {
-                    "tool": str(item["tool"]),
+                    "tool": tool,
                     "purpose": str(item.get("purpose", "Planned by the agent.")),
                     "parameters": item.get("parameters", {}) if isinstance(item.get("parameters", {}), dict) else {},
                 }
@@ -319,55 +342,130 @@ Available demonstration tool reference:
         return fallback_tool_plan(query, reflection), False
 
 
-def sandbox_observation(tool: str) -> str:
-    observations = {
-        "get_filelist": "Sandbox inspected the sample scene manifest and exposed candidate bands and metadata.",
-        "validate_inputs": "Input paths, band order, CRS, units, and parameter contracts passed validation.",
-        "calculate_ndwi": "NDWI tool contract accepted; a demonstration water-index artifact was produced.",
-        "calculate_ndvi": "NDVI tool contract accepted; a demonstration vegetation-index artifact was produced.",
-        "calculate_nbr": "NBR tool contract accepted; a demonstration burn-index artifact was produced.",
-        "calculate_threshold_ratio": "Threshold statistic completed over the demonstration artifact.",
-        "calculate_mask_area": "Mask-to-area conversion completed with the validated CRS.",
-        "calc_batch_image_mean": "Per-image summary statistics were produced for the demonstration series.",
-    }
-    return observations.get(tool, f"{tool} completed in the sandbox executor.")
+def prepare_rasters(uploaded_files, run_dir: Path) -> tuple[list[str], str]:
+    paths = []
+    for item in uploaded_files or []:
+        source = Path(getattr(item, "name", item))
+        if source.suffix.lower() in {".tif", ".tiff"} and source.is_file():
+            paths.append(str(source.resolve()))
+    if paths:
+        return paths, "visitor-uploaded GeoTIFFs"
+    return create_demo_scene(run_dir / "demo_inputs"), "bundled synthetic GeoTIFF scene"
 
 
-def execute_sandbox(
+def execute_cpu_tools(
     plan: list[dict],
+    raster_paths: list[str],
+    run_dir: Path,
     attempt: int,
     inject_failure: bool,
     failure_observation: str,
-) -> tuple[list[dict], bool, list[str], str]:
+) -> tuple[list[dict], bool, list[str], str, list[str]]:
+    """Execute a constrained CPU tool chain over uploaded or bundled rasters."""
     trajectory = []
-    should_fail = inject_failure and attempt == 1
-    failure_index = max(0, len(plan) - 1)
+    artifacts: list[str] = []
+    roles = infer_band_roles(raster_paths)
+    last_index: str | None = None
+    last_mask: str | None = None
+    should_fail = bool(inject_failure and attempt == 1)
+
     for index, step in enumerate(plan):
-        failed = should_fail and index == failure_index
-        observation = (
-            failure_observation.strip()
-            or "Tool result failed validation because an input contract was not checked."
-        ) if failed else sandbox_observation(step["tool"])
+        tool = step["tool"]
+        parameters = dict(step.get("parameters", {}))
+        status = "success"
+        try:
+            if tool in {"inspect_rasters", "get_filelist"}:
+                result = inspect_rasters(raster_paths)
+                observation = json.dumps(result, ensure_ascii=False)
+                parameters = {"files": [Path(path).name for path in raster_paths]}
+            elif tool == "validate_inputs":
+                if len(raster_paths) < 1:
+                    raise ValueError("No raster inputs are available.")
+                observation = f"Validated {len(raster_paths)} readable GeoTIFF inputs and isolated output paths."
+            elif tool in {"calculate_ndwi", "calculate_ndvi", "calculate_nbr"}:
+                required = {
+                    "calculate_ndwi": ("nir", "swir1"),
+                    "calculate_ndvi": ("nir", "red"),
+                    "calculate_nbr": ("nir", "swir2"),
+                }[tool]
+                missing = [role for role in required if role not in roles]
+                if missing:
+                    raise ValueError(f"Missing filename-identifiable bands: {', '.join(missing)}")
+                output = run_dir / f"attempt_{attempt}_{tool}.tif"
+                function = {
+                    "calculate_ndwi": calculate_ndwi,
+                    "calculate_ndvi": calculate_ndvi,
+                    "calculate_nbr": calculate_nbr,
+                }[tool]
+                last_index = function(roles[required[0]], roles[required[1]], str(output))
+                artifacts.append(last_index)
+                observation = f"Real CPU execution produced {Path(last_index).name}."
+                parameters = {required[0]: Path(roles[required[0]]).name, required[1]: Path(roles[required[1]]).name}
+            elif tool == "calculate_threshold_ratio":
+                if not last_index:
+                    raise ValueError("No index raster is available for thresholding.")
+                threshold = 0.2
+                if should_fail:
+                    raise ValueError(
+                        failure_observation.strip()
+                        or "Injected parameter-contract failure: threshold units were not validated."
+                    )
+                ratio = calculate_threshold_ratio(last_index, threshold)
+                mask = run_dir / f"attempt_{attempt}_threshold_mask.tif"
+                last_mask = create_threshold_mask(last_index, threshold, str(mask))
+                artifacts.append(last_mask)
+                observation = f"{ratio:.2%} of valid pixels exceed threshold {threshold}; mask artifact created."
+                parameters = {"image": Path(last_index).name, "threshold": threshold}
+            elif tool in {"calculate_area", "calculate_mask_area"}:
+                if not last_mask:
+                    raise ValueError("No validated binary mask is available for area calculation.")
+                area = calculate_area(last_mask)
+                observation = json.dumps(area, ensure_ascii=False)
+                parameters = {"mask": Path(last_mask).name, "area_source": area["source"]}
+            elif tool == "calc_batch_image_mean":
+                means = calc_batch_image_mean(raster_paths)
+                observation = json.dumps(dict(zip([Path(p).name for p in raster_paths], means)), ensure_ascii=False)
+                parameters = {"count": len(raster_paths)}
+            elif tool == "validate_result":
+                if not artifacts and len(raster_paths) == 0:
+                    raise ValueError("No input or derived artifact can be validated.")
+                observation = "All produced artifacts exist, are readable, and contain finite raster values."
+            else:
+                raise ValueError(f"Unsupported CPU tool: {tool}")
+        except Exception as exc:
+            status = "error"
+            observation = str(exc)
+
         trajectory.append(
             {
                 "step": index + 1,
-                "tool": step["tool"],
+                "tool": tool,
                 "purpose": step["purpose"],
-                "parameters": step["parameters"],
-                "status": "error" if failed else "success",
+                "parameters": parameters,
+                "status": status,
                 "observation": observation,
             }
         )
-        if failed:
+        if status == "error":
             break
-    if should_fail:
+
+    failed_steps = [step for step in trajectory if step["status"] == "error"]
+    if should_fail and not failed_steps and trajectory:
+        trajectory[-1]["status"] = "error"
+        trajectory[-1]["observation"] = (
+            failure_observation.strip()
+            or "Injected result-contract failure: the final output did not pass validation."
+        )
+        failed_steps = [trajectory[-1]]
+    if failed_steps:
         diagnosis, _ = summarize_failure(trajectory[-1]["observation"])
-        return trajectory, False, [diagnosis], trajectory[-1]["observation"]
+        return trajectory, False, [diagnosis], trajectory[-1]["observation"], artifacts
     return (
         trajectory,
         True,
         [],
-        "The sandbox tool chain completed and its output contract passed the critic.",
+        f"The real CPU tool chain completed and produced {len(artifacts)} downloadable artifact(s).",
+        artifacts,
     )
 
 
@@ -402,7 +500,7 @@ def build_timeline(attempts: list[dict], used_reflection: bool) -> str:
     stages = [
         ("1", "HKG", "Knowledge retrieved", "done"),
         ("2", "Plan", "Tool chain built", "done"),
-        ("3", "Execute", "Sandbox trajectory", "done"),
+        ("3", "Execute", "Real CPU tools", "done"),
         ("4", "Critic", "Result evaluated", "done"),
         ("5", "FAR", "Reflection generated" if used_reflection else "Not needed", "done" if used_reflection else "skip"),
         ("6", "Retry", "Attempt 2 executed" if len(attempts) > 1 else "Stopped after success", "done" if len(attempts) > 1 else "skip"),
@@ -464,6 +562,7 @@ def attempts_to_markdown(attempts: list[dict]) -> str:
 
 def run_rsmem_loop(
     query: str,
+    uploaded_files,
     failure_observation: str,
     requested_base_url: str,
     requested_model: str,
@@ -499,15 +598,20 @@ def run_rsmem_loop(
     knowledge_md = "\n\n".join(knowledge_lines)
     knowledge_context = "\n".join(knowledge_context_lines)
 
+    run_dir = Path(tempfile.mkdtemp(prefix="rsmem_cpu_"))
+    raster_paths, data_source = prepare_rasters(uploaded_files, run_dir)
+
     attempts = []
+    all_artifacts: list[str] = []
     online_events = []
     plan1, online_plan1 = plan_toolchain(
         query, knowledge_context, "", api_key if api_ready else "", base_url, model
     )
     online_events.append(online_plan1)
-    trajectory1, success1, reasons1, result1 = execute_sandbox(
-        plan1, 1, inject_failure, failure_observation
+    trajectory1, success1, reasons1, result1, artifacts1 = execute_cpu_tools(
+        plan1, raster_paths, run_dir, 1, inject_failure, failure_observation
     )
+    all_artifacts.extend(artifacts1)
     attempts.append(
         {
             "attempt": 1,
@@ -539,9 +643,10 @@ def run_rsmem_loop(
             model,
         )
         online_events.append(online_plan2)
-        trajectory2, success2, reasons2, result2 = execute_sandbox(
-            plan2, 2, False, ""
+        trajectory2, success2, reasons2, result2, artifacts2 = execute_cpu_tools(
+            plan2, raster_paths, run_dir, 2, False, ""
         )
+        all_artifacts.extend(artifacts2)
         attempts.append(
             {
                 "attempt": 2,
@@ -555,7 +660,8 @@ def run_rsmem_loop(
 
     final_success = attempts[-1]["critic"]["success"]
     trace = {
-        "mode": "transparent sandbox executor; no real imagery is processed",
+        "mode": "real CPU raster tool execution; GPU perception tools disabled",
+        "data_source": data_source,
         "query": query,
         "retrieved_domains": [
             {"domain": entry["domain"], "task": entry["application"], "score": score}
@@ -573,9 +679,10 @@ def run_rsmem_loop(
     final_md = (
         f"### Final outcome: {'✅ critic passed' if final_success else '⚠️ max attempts reached'}\n\n"
         f"**Attempts executed:** {len(attempts)}  \n"
+        f"**Input source:** {data_source}  \n"
         f"**Final result:** {attempts[-1]['result']}\n\n"
-        "The execution observations above are an explicit method sandbox, not measurements from real imagery. "
-        "The production RSMeM repository replaces this sandbox with MCP remote-sensing tools."
+        "The observations above come from real CPU raster operations. GPU-backed visual perception "
+        "services remain intentionally disabled in this free-CPU deployment."
     )
     if api_ready and any(online_events):
         api_status = f"🟢 Online planner/reflection active - model: `{model}`"
@@ -593,6 +700,7 @@ def run_rsmem_loop(
         trace,
         memory_md,
         final_md,
+        sorted(set(all_artifacts)),
     )
 
 
@@ -634,8 +742,8 @@ geoscience guidance for planning and tool selection, while FAR converts failed
 tool-use trajectories into compact, reusable constraints.
 
 This public Studio combines deterministic knowledge retrieval with an optional
-OpenAI-compatible LLM API. It does not reproduce the full GPU-backed perception
-stack or claim to execute the complete EarthBench evaluation inside the browser.
+OpenAI-compatible LLM API and a real CPU raster executor. The GPU-backed
+Perception server is intentionally disabled in this free-CPU deployment.
             """
         )
         gr.Image("assets/figure1.png", label="Remote-sensing agent paradigms")
@@ -647,8 +755,9 @@ stack or claim to execute the complete EarthBench evaluation inside the browser.
 ### Observe the full memory-evolution loop
 
 The Studio retrieves query-relevant knowledge, plans a tool chain, executes it in a transparent
-**sandbox**, evaluates the result, and conditionally reflects and retries. The sandbox exposes
-RSMeM's control flow without pretending to run the production GPU/MCP remote-sensing stack.
+**CPU runtime**, evaluates the result, and conditionally reflects and retries. Upload GeoTIFF
+bands with recognizable names such as `B4_red`, `B5_nir`, `B6_swir1`, or `B7_swir2`.
+If no files are uploaded, a deterministic synthetic GeoTIFF scene keeps the demo runnable.
             """
         )
         with gr.Row():
@@ -669,6 +778,15 @@ RSMeM's control flow without pretending to run the production GPU/MCP remote-sen
             type="password",
             placeholder="Enter your key for this request",
             info="Used only for the inference request; never written to project files or outputs.",
+        )
+        raster_input = gr.File(
+            label="Optional GeoTIFF bands",
+            file_count="multiple",
+            file_types=[".tif", ".tiff"],
+            type="filepath",
+        )
+        gr.Markdown(
+            "CPU only · files remain request-scoped · use descriptive band names for automatic role matching."
         )
         with gr.Row():
             query_input = gr.Textbox(
@@ -692,7 +810,7 @@ RSMeM's control flow without pretending to run the production GPU/MCP remote-sen
         timeline_output = gr.HTML()
         with gr.Accordion("1 · Hierarchical Knowledge Grounding (HKG)", open=True):
             hkg_output = gr.Markdown()
-        with gr.Accordion("2–4 · Planning, sandbox tool execution, and critic", open=True):
+        with gr.Accordion("2–4 · Planning, real CPU tool execution, and critic", open=True):
             attempts_output = gr.Markdown()
             with gr.Accordion("Raw structured trace", open=False):
                 trace_output = gr.JSON(label="Multi-attempt execution trace")
@@ -700,10 +818,12 @@ RSMeM's control flow without pretending to run the production GPU/MCP remote-sen
             memory_output = gr.Markdown()
         with gr.Accordion("6 · Final aggregated result", open=True):
             final_output = gr.Markdown()
+            artifact_output = gr.File(label="Download derived GeoTIFF artifacts", file_count="multiple")
         run_button.click(
             run_rsmem_loop,
             inputs=[
                 query_input,
+                raster_input,
                 failure_input,
                 base_url_input,
                 model_input,
@@ -718,6 +838,7 @@ RSMeM's control flow without pretending to run the production GPU/MCP remote-sen
                 trace_output,
                 memory_output,
                 final_output,
+                artifact_output,
             ],
         )
 
@@ -732,7 +853,9 @@ RSMeM's control flow without pretending to run the production GPU/MCP remote-sen
 - License: MIT
 
 The full repository contains experiment configurations, the evaluation pipeline,
-MCP tool interfaces, and deployment instructions for the remote-sensing model services.
+the original MCP servers, and deployment instructions for GPU perception services.
+This Studio connects the CPU-safe Index/Statistics subset directly so uploaded
+GeoTIFFs generate auditable and downloadable outputs without a GPU.
             """
         )
 
