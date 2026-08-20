@@ -25,6 +25,8 @@ def _read_band(path: str | Path) -> tuple[np.ndarray, dict]:
         raise ValueError(f"Unsupported raster type: {path.suffix}")
     with rasterio.open(path) as src:
         data = src.read(1).astype(np.float32)
+        if src.nodata is not None:
+            data[data == src.nodata] = np.nan
         profile = src.profile.copy()
     return data, profile
 
@@ -60,6 +62,56 @@ def calculate_ndwi(nir_path: str, swir_path: str, output_path: str) -> str:
 
 def calculate_nbr(nir_path: str, swir2_path: str, output_path: str) -> str:
     return _normalized_difference(nir_path, swir2_path, output_path)
+
+
+def compute_tvdi(ndvi_path: str, lst_path: str, output_path: str) -> str:
+    """Compute TVDI with the trapezoidal NDVI-LST feature-space method."""
+    ndvi_raw, profile = _read_band(ndvi_path)
+    lst_raw, _ = _read_band(lst_path)
+    if ndvi_raw.shape != lst_raw.shape:
+        raise ValueError(f"Raster shape mismatch: {ndvi_raw.shape} versus {lst_raw.shape}")
+
+    # Match the scale factors used by the released RSMeM Index tool.
+    ndvi = ndvi_raw * 0.0001 if np.nanpercentile(np.abs(ndvi_raw), 95) > 2 else ndvi_raw
+    lst = lst_raw * 0.02 if np.nanpercentile(lst_raw, 95) > 1000 else lst_raw
+    valid = np.isfinite(ndvi) & np.isfinite(lst) & (ndvi >= 0) & (ndvi <= 1) & (lst > 0)
+    if np.count_nonzero(valid) < 100:
+        raise ValueError("Too few valid NDVI/LST pixels for TVDI regression.")
+
+    ndvi_valid, lst_valid = ndvi[valid], lst[valid]
+    bins = np.linspace(float(ndvi_valid.min()), float(ndvi_valid.max()), 101)
+    centers, dry_edge, wet_edge = [], [], []
+    for index in range(100):
+        selected = (ndvi_valid >= bins[index]) & (ndvi_valid < bins[index + 1])
+        if np.any(selected):
+            centers.append((bins[index] + bins[index + 1]) / 2)
+            dry_edge.append(float(np.max(lst_valid[selected])))
+            wet_edge.append(float(np.min(lst_valid[selected])))
+    if len(centers) < 2:
+        raise ValueError("Not enough occupied NDVI bins for TVDI regression.")
+
+    dry_slope, dry_intercept = np.polyfit(centers, dry_edge, 1)
+    wet_slope, wet_intercept = np.polyfit(centers, wet_edge, 1)
+    maximum = ndvi * dry_slope + dry_intercept
+    minimum = ndvi * wet_slope + wet_intercept
+    denominator = maximum - minimum
+    tvdi = np.divide(lst - minimum, denominator, out=np.full_like(lst, np.nan), where=np.abs(denominator) > 1e-6)
+    tvdi = np.clip(tvdi, 0, 1)
+    tvdi[~valid] = np.nan
+    return _write_band(output_path, tvdi, profile)
+
+
+def sens_slope(values: list[float]) -> dict:
+    if len(values) < 2:
+        raise ValueError("At least two time-series values are required for Sen's slope.")
+    slopes = [
+        (values[j] - values[i]) / (j - i)
+        for i in range(len(values) - 1)
+        for j in range(i + 1, len(values))
+    ]
+    slope = float(np.median(slopes))
+    direction = "increasing" if slope > 0 else "decreasing" if slope < 0 else "stable"
+    return {"slope_per_observation": slope, "direction": direction, "observations": len(values)}
 
 
 def calculate_threshold_ratio(image_path: str, threshold: float = 0.0) -> float:

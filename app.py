@@ -21,10 +21,12 @@ from cpu_tools import (
     calculate_ndvi,
     calculate_ndwi,
     calculate_threshold_ratio,
+    compute_tvdi,
     create_demo_scene,
     create_threshold_mask,
     infer_band_roles,
     inspect_rasters,
+    sens_slope,
 )
 
 
@@ -36,6 +38,34 @@ GITHUB_URL = "https://github.com/AI9Stars/RSMeM"
 LEARN_URL = "https://modelscope.cn/learn/434564"
 DEFAULT_BASE_URL = "https://uni-api.cstcloud.cn/v1"
 DEFAULT_MODEL = "deepseek-v4-flash-aistar"
+
+EXAMPLES = {
+    "🌾 Sichuan agricultural drought (TVDI)": {
+        "directory": "tvdi_sichuan",
+        "query": "Calculate TVDI for the Sichuan Plain agricultural area and determine the percentage of valid pixels where TVDI exceeds 0.75.",
+        "failure": "The first attempt used an unvalidated TVDI threshold contract, so the dryness-area result failed the critic.",
+        "description": "2 GeoTIFFs · NDVI + LST → TVDI → threshold ratio → affected area",
+    },
+    "🔥 California wildfire trend (NBR)": {
+        "directory": "nbr_california",
+        "query": "Using California B02 and B07 surface-reflectance images from January to March 2025, calculate NBR for every date, summarize the daily mean NBR series, and estimate its trend with Sen's slope.",
+        "failure": "The first attempt did not validate date pairing between the B02 and B07 time series before trend estimation.",
+        "description": "22 GeoTIFFs · 11 paired dates → NBR series → regional means → Sen's slope",
+    },
+    "🌃 Bhutan nighttime-light comparison": {
+        "directory": "nightlights_bhutan",
+        "query": "Compare Bhutan nighttime-light intensity in June and August 2024 by computing the spatial mean of each GeoTIFF, identify the lower month, and report the absolute difference.",
+        "failure": "The first attempt produced means but did not preserve date ordering before calculating the month-to-month difference.",
+        "description": "2 GeoTIFFs · regional means → temporal comparison → absolute difference",
+    },
+    "📤 Custom GeoTIFF upload": {
+        "directory": None,
+        "query": "Analyze the uploaded remote-sensing GeoTIFFs with an appropriate CPU tool chain.",
+        "failure": "The first attempt did not fully validate the raster and parameter contract.",
+        "description": "Upload your own GeoTIFF bands; recognizable band names improve automatic pairing.",
+    },
+}
+DEFAULT_EXAMPLE = next(iter(EXAMPLES))
 
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how",
@@ -173,16 +203,19 @@ TOOL_REFERENCE = """
 - calculate_ndwi: calculate the released RSMeM NIR/SWIR water-moisture index.
 - calculate_ndvi: estimate vegetation greenness from NIR and Red bands.
 - calculate_nbr: assess burned areas from NIR and SWIR2 bands.
+- compute_tvdi: derive agricultural dryness from aligned NDVI and LST rasters.
 - calculate_threshold_ratio: summarize the fraction of raster pixels satisfying a threshold.
 - calc_batch_image_mean: produce one scalar mean per raster/date.
+- sens_slope: estimate a robust monotonic trend from a raster-derived time series.
+- difference: compute an absolute difference between two regional statistics.
 - calculate_area: convert a validated binary mask into physical area.
 """.strip()
 
 SUPPORTED_TOOLS = {
     "inspect_rasters", "get_filelist", "validate_inputs", "calculate_ndwi",
-    "calculate_ndvi", "calculate_nbr", "calculate_threshold_ratio",
+    "calculate_ndvi", "calculate_nbr", "compute_tvdi", "calculate_threshold_ratio",
     "create_threshold_mask", "calculate_area", "calculate_mask_area",
-    "calc_batch_image_mean", "validate_result",
+    "calc_batch_image_mean", "sens_slope", "difference", "validate_result",
 }
 
 
@@ -235,7 +268,34 @@ def fallback_tool_plan(query: str, reflection: str = "") -> list[dict]:
             "parameters": {"source": "visitor uploads or bundled CPU demo scene"},
         }
     ]
-    if any(term in low for term in ("flood", "water", "inundation")):
+    if any(term in low for term in ("tvdi", "dryness", "drought")):
+        plan.extend(
+            [
+                {
+                    "tool": "compute_tvdi",
+                    "purpose": "Derive TVDI from aligned and scale-validated NDVI/LST rasters.",
+                    "parameters": {"inputs": "NDVI and LST", "scale_factors": "auto-validated"},
+                },
+                {
+                    "tool": "calculate_threshold_ratio",
+                    "purpose": "Quantify the fraction of valid pixels with TVDI above 0.75.",
+                    "parameters": {"threshold": 0.75},
+                },
+                {
+                    "tool": "calculate_area",
+                    "purpose": "Translate the dry-pixel mask into pixels and physical area when georeferencing permits.",
+                    "parameters": {},
+                },
+            ]
+        )
+    elif any(term in low for term in ("nighttime", "night-light", "night light")):
+        plan.extend(
+            [
+                {"tool": "calc_batch_image_mean", "purpose": "Compute the spatial mean for each dated night-light raster.", "parameters": {}},
+                {"tool": "difference", "purpose": "Compare the two dated regional means and report the absolute change.", "parameters": {}},
+            ]
+        )
+    elif any(term in low for term in ("flood", "water", "inundation")):
         plan.extend(
             [
                 {
@@ -255,11 +315,12 @@ def fallback_tool_plan(query: str, reflection: str = "") -> list[dict]:
                 },
             ]
         )
-    elif any(term in low for term in ("fire", "burn", "wildfire")):
+    elif any(term in low for term in ("fire", "burn", "wildfire", "nbr")):
         plan.extend(
             [
-                {"tool": "calculate_nbr", "purpose": "Compute a burn-sensitive index.", "parameters": {}},
-                {"tool": "calculate_threshold_ratio", "purpose": "Summarize affected area.", "parameters": {}},
+                {"tool": "calculate_nbr", "purpose": "Pair every date and compute a burn-sensitive NBR time series.", "parameters": {}},
+                {"tool": "calc_batch_image_mean", "purpose": "Summarize each dated NBR raster into a regional mean.", "parameters": {}},
+                {"tool": "sens_slope", "purpose": "Estimate the robust direction and magnitude of the NBR trend.", "parameters": {}},
             ]
         )
     elif any(term in low for term in ("vegetation", "crop", "forest", "ndvi")):
@@ -311,6 +372,32 @@ def normalize_plan(data: dict | list | None, query: str, reflection: str) -> lis
     return normalized or fallback_tool_plan(query, reflection)
 
 
+def stabilize_example_plan(plan: list[dict], query: str, reflection: str) -> list[dict]:
+    """Keep bundled demonstrations executable while retaining model-authored details."""
+    low = query.lower()
+    is_bundled_pattern = any(
+        cue in low for cue in ("tvdi", "sen's slope", "nighttime-light", "night light")
+    )
+    if not is_bundled_pattern:
+        return plan
+    required = fallback_tool_plan(query, reflection)
+    authored = {step["tool"]: step for step in plan}
+    stabilized = []
+    for step in required:
+        model_step = authored.get(step["tool"])
+        if model_step:
+            stabilized.append(
+                {
+                    "tool": step["tool"],
+                    "purpose": model_step.get("purpose") or step["purpose"],
+                    "parameters": model_step.get("parameters") or step["parameters"],
+                }
+            )
+        else:
+            stabilized.append(step)
+    return stabilized
+
+
 def plan_toolchain(
     query: str,
     knowledge_context: str,
@@ -337,12 +424,18 @@ Available demonstration tool reference:
 """
     try:
         raw = api_completion(api_key, base_url, model, system, user, max_tokens=700)
-        return normalize_plan(extract_json_object(raw), query, reflection), True
+        normalized = normalize_plan(extract_json_object(raw), query, reflection)
+        return stabilize_example_plan(normalized, query, reflection), True
     except Exception:
         return fallback_tool_plan(query, reflection), False
 
 
-def prepare_rasters(uploaded_files, run_dir: Path) -> tuple[list[str], str]:
+def load_example(example_name: str):
+    example = EXAMPLES.get(example_name, EXAMPLES[DEFAULT_EXAMPLE])
+    return example["query"], example["failure"], f"**Dataset:** {example['description']}"
+
+
+def prepare_rasters(uploaded_files, run_dir: Path, example_name: str) -> tuple[list[str], str]:
     paths = []
     for item in uploaded_files or []:
         source = Path(getattr(item, "name", item))
@@ -350,6 +443,12 @@ def prepare_rasters(uploaded_files, run_dir: Path) -> tuple[list[str], str]:
             paths.append(str(source.resolve()))
     if paths:
         return paths, "visitor-uploaded GeoTIFFs"
+    example = EXAMPLES.get(example_name, EXAMPLES[DEFAULT_EXAMPLE])
+    if example["directory"]:
+        directory = ROOT / "examples" / example["directory"]
+        bundled = sorted(str(path.resolve()) for path in directory.glob("*.tif"))
+        if bundled:
+            return bundled, f"bundled EarthBench example: {example_name}"
     return create_demo_scene(run_dir / "demo_inputs"), "bundled synthetic GeoTIFF scene"
 
 
@@ -367,6 +466,9 @@ def execute_cpu_tools(
     roles = infer_band_roles(raster_paths)
     last_index: str | None = None
     last_mask: str | None = None
+    derived_for_stats: list[str] = []
+    last_values: list[float] = []
+    last_index_kind = ""
     should_fail = bool(inject_failure and attempt == 1)
 
     for index, step in enumerate(plan):
@@ -376,13 +478,58 @@ def execute_cpu_tools(
         try:
             if tool in {"inspect_rasters", "get_filelist"}:
                 result = inspect_rasters(raster_paths)
-                observation = json.dumps(result, ensure_ascii=False)
-                parameters = {"files": [Path(path).name for path in raster_paths]}
+                observation = json.dumps(
+                    {"count": len(result), "sample": result[:6], "truncated": len(result) > 6},
+                    ensure_ascii=False,
+                )
+                parameters = {"files": [Path(path).name for path in raster_paths[:8]], "total": len(raster_paths)}
             elif tool == "validate_inputs":
                 if len(raster_paths) < 1:
                     raise ValueError("No raster inputs are available.")
                 observation = f"Validated {len(raster_paths)} readable GeoTIFF inputs and isolated output paths."
+            elif tool == "compute_tvdi":
+                ndvi_paths = [path for path in raster_paths if "ndvi" in Path(path).name.lower()]
+                lst_paths = [path for path in raster_paths if "lst" in Path(path).name.lower()]
+                if len(ndvi_paths) != 1 or len(lst_paths) != 1:
+                    raise ValueError("TVDI requires exactly one filename-identifiable NDVI and one LST raster.")
+                output = run_dir / f"attempt_{attempt}_tvdi.tif"
+                last_index = compute_tvdi(ndvi_paths[0], lst_paths[0], str(output))
+                last_index_kind = "tvdi"
+                derived_for_stats = [last_index]
+                artifacts.append(last_index)
+                observation = f"Real CPU TVDI regression produced {Path(last_index).name}."
+                parameters = {"ndvi": Path(ndvi_paths[0]).name, "lst": Path(lst_paths[0]).name}
             elif tool in {"calculate_ndwi", "calculate_ndvi", "calculate_nbr"}:
+                if tool == "calculate_nbr":
+                    dated = {}
+                    for path in raster_paths:
+                        name = Path(path).name.lower()
+                        match = re.search(r"\d{4}-\d{2}-\d{2}", name)
+                        if match and ("b02" in name or "b07" in name):
+                            dated.setdefault(match.group(), {})["nir" if "b02" in name else "swir2"] = path
+                    pairs = [(date, pair) for date, pair in sorted(dated.items()) if {"nir", "swir2"} <= pair.keys()]
+                    if pairs:
+                        outputs = []
+                        for date, pair in pairs:
+                            output = run_dir / f"attempt_{attempt}_nbr_{date}.tif"
+                            outputs.append(calculate_nbr(pair["nir"], pair["swir2"], str(output)))
+                        last_index = outputs[-1]
+                        last_index_kind = "nbr"
+                        derived_for_stats = outputs
+                        artifacts.extend(outputs)
+                        observation = f"Paired {len(pairs)} dates and produced a real NBR GeoTIFF time series."
+                        parameters = {"dates": [date for date, _ in pairs]}
+                        trajectory.append(
+                            {
+                                "step": index + 1,
+                                "tool": tool,
+                                "purpose": step["purpose"],
+                                "parameters": parameters,
+                                "status": "success",
+                                "observation": observation,
+                            }
+                        )
+                        continue
                 required = {
                     "calculate_ndwi": ("nir", "swir1"),
                     "calculate_ndvi": ("nir", "red"),
@@ -398,13 +545,15 @@ def execute_cpu_tools(
                     "calculate_nbr": calculate_nbr,
                 }[tool]
                 last_index = function(roles[required[0]], roles[required[1]], str(output))
+                last_index_kind = tool.replace("calculate_", "")
+                derived_for_stats = [last_index]
                 artifacts.append(last_index)
                 observation = f"Real CPU execution produced {Path(last_index).name}."
                 parameters = {required[0]: Path(roles[required[0]]).name, required[1]: Path(roles[required[1]]).name}
             elif tool == "calculate_threshold_ratio":
                 if not last_index:
                     raise ValueError("No index raster is available for thresholding.")
-                threshold = 0.2
+                threshold = 0.75 if last_index_kind == "tvdi" else 0.2
                 if should_fail:
                     raise ValueError(
                         failure_observation.strip()
@@ -423,9 +572,24 @@ def execute_cpu_tools(
                 observation = json.dumps(area, ensure_ascii=False)
                 parameters = {"mask": Path(last_mask).name, "area_source": area["source"]}
             elif tool == "calc_batch_image_mean":
-                means = calc_batch_image_mean(raster_paths)
-                observation = json.dumps(dict(zip([Path(p).name for p in raster_paths], means)), ensure_ascii=False)
-                parameters = {"count": len(raster_paths)}
+                targets = derived_for_stats or raster_paths
+                last_values = calc_batch_image_mean(targets)
+                observation = json.dumps(dict(zip([Path(p).name for p in targets], last_values)), ensure_ascii=False)
+                parameters = {"count": len(targets), "source": "derived rasters" if derived_for_stats else "input rasters"}
+            elif tool == "sens_slope":
+                trend = sens_slope(last_values)
+                observation = json.dumps(trend, ensure_ascii=False)
+                parameters = {"values": last_values}
+            elif tool == "difference":
+                if len(last_values) < 2:
+                    raise ValueError("Difference requires at least two preceding regional statistics.")
+                change = abs(last_values[1] - last_values[0])
+                direction = "second period is higher" if last_values[1] > last_values[0] else "first period is higher"
+                observation = json.dumps(
+                    {"first": last_values[0], "second": last_values[1], "absolute_difference": change, "direction": direction},
+                    ensure_ascii=False,
+                )
+                parameters = {"a": last_values[0], "b": last_values[1]}
             elif tool == "validate_result":
                 if not artifacts and len(raster_paths) == 0:
                     raise ValueError("No input or derived artifact can be validated.")
@@ -562,6 +726,7 @@ def attempts_to_markdown(attempts: list[dict]) -> str:
 
 def run_rsmem_loop(
     query: str,
+    example_name: str,
     uploaded_files,
     failure_observation: str,
     requested_base_url: str,
@@ -599,7 +764,7 @@ def run_rsmem_loop(
     knowledge_context = "\n".join(knowledge_context_lines)
 
     run_dir = Path(tempfile.mkdtemp(prefix="rsmem_cpu_"))
-    raster_paths, data_source = prepare_rasters(uploaded_files, run_dir)
+    raster_paths, data_source = prepare_rasters(uploaded_files, run_dir, example_name)
 
     attempts = []
     all_artifacts: list[str] = []
@@ -757,9 +922,15 @@ Perception server is intentionally disabled in this free-CPU deployment.
 The Studio retrieves query-relevant knowledge, plans a tool chain, executes it in a transparent
 **CPU runtime**, evaluates the result, and conditionally reflects and retries. Upload GeoTIFF
 bands with recognizable names such as `B4_red`, `B5_nir`, `B6_swir1`, or `B7_swir2`.
-If no files are uploaded, a deterministic synthetic GeoTIFF scene keeps the demo runnable.
+Choose one of three bundled EarthBench cases, or switch to custom upload.
             """
         )
+        example_input = gr.Dropdown(
+            label="EarthBench example",
+            choices=list(EXAMPLES),
+            value=DEFAULT_EXAMPLE,
+        )
+        dataset_info = gr.Markdown(f"**Dataset:** {EXAMPLES[DEFAULT_EXAMPLE]['description']}")
         with gr.Row():
             base_url_input = gr.Textbox(
                 label="OpenAI-compatible Base URL",
@@ -780,23 +951,23 @@ If no files are uploaded, a deterministic synthetic GeoTIFF scene keeps the demo
             info="Used only for the inference request; never written to project files or outputs.",
         )
         raster_input = gr.File(
-            label="Optional GeoTIFF bands",
+            label="Optional GeoTIFF override",
             file_count="multiple",
             file_types=[".tif", ".tiff"],
             type="filepath",
         )
         gr.Markdown(
-            "CPU only · files remain request-scoped · use descriptive band names for automatic role matching."
+            "Uploaded files override the bundled example. CPU only · files remain request-scoped."
         )
         with gr.Row():
             query_input = gr.Textbox(
                 label="Remote-sensing task",
-                value="Map flooded areas after a major storm using multispectral satellite imagery.",
+                value=EXAMPLES[DEFAULT_EXAMPLE]["query"],
                 lines=3,
             )
             failure_input = gr.Textbox(
                 label="Attempt-1 execution observation",
-                value="The flood-mapping tool returned an invalid parameter error because the CRS and threshold units were not checked.",
+                value=EXAMPLES[DEFAULT_EXAMPLE]["failure"],
                 lines=3,
                 info="Used as the recoverable tool failure shown in the first trajectory.",
             )
@@ -804,6 +975,11 @@ If no files are uploaded, a deterministic synthetic GeoTIFF scene keeps the demo
             value=True,
             label="Inject a recoverable failure in Attempt 1",
             info="Turn off to show the conditional early-stop path when the first result passes.",
+        )
+        example_input.change(
+            load_example,
+            inputs=[example_input],
+            outputs=[query_input, failure_input, dataset_info],
         )
         run_button = gr.Button("Run the complete RSMeM loop", variant="primary")
         api_status = gr.Markdown("⚪ Ready. Run the workflow to generate an observable trace.")
@@ -823,6 +999,7 @@ If no files are uploaded, a deterministic synthetic GeoTIFF scene keeps the demo
             run_rsmem_loop,
             inputs=[
                 query_input,
+                example_input,
                 raster_input,
                 failure_input,
                 base_url_input,
@@ -849,8 +1026,9 @@ If no files are uploaded, a deterministic synthetic GeoTIFF scene keeps the demo
 
 - [Source code on GitHub]({GITHUB_URL})
 - [ModelScope Learn article]({LEARN_URL})
+- [Earth-Bench example-data source](https://huggingface.co/datasets/Sssunset/Earth-Bench) (Apache-2.0)
 - Knowledge base included in this Studio: 3 domains, 12 subdomains, and 64 atomic tasks
-- License: MIT
+- Code license: MIT · bundled example-data license: Apache-2.0
 
 The full repository contains experiment configurations, the evaluation pipeline,
 the original MCP servers, and deployment instructions for GPU perception services.

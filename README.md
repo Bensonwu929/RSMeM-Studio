@@ -45,10 +45,22 @@ framework:
 
 The hosted Studio accepts optional `.tif`/`.tiff` uploads and recognizes common
 band names such as `B4_red`, `B5_nir`, `B6_swir1`, and `B7_swir2`. If no files
-are uploaded, it creates a deterministic synthetic GeoTIFF scene so the whole
-pipeline remains testable. The CPU runtime mirrors selected public RSMeM
+are uploaded, visitors can run one of three bundled EarthBench demonstrations:
+
+1. Sichuan agricultural drought: NDVI + LST → TVDI → dry-area ratio.
+2. California wildfire trend: 11 paired dates → NBR means → Sen's slope.
+3. Bhutan nighttime lights: two regional means → month-to-month difference.
+
+The CPU runtime mirrors selected public RSMeM
 Index/Statistics tool contracts using Rasterio and NumPy. GPU perception tools
 are intentionally disabled on the free CPU instance.
+
+## Data attribution
+
+Bundled example GeoTIFFs are subsets of
+[Sssunset/Earth-Bench](https://huggingface.co/datasets/Sssunset/Earth-Bench),
+released under Apache-2.0. See [`DATA_LICENSE.md`](DATA_LICENSE.md). RSMeM Studio
+code is MIT-licensed; the third-party example data retains its original license.
 
 ## API use
 
