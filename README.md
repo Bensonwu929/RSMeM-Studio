@@ -29,7 +29,7 @@ CPU-only raster toolchain produces auditable GeoTIFF outputs and supports
 visitor-provided OpenAI-compatible models without storing API credentials.
 
 - Studio: https://modelscope.cn/studios/wbx929/RSMeM
-- Learn article: pending publication from [`LEARN_ARTICLE.md`](LEARN_ARTICLE.md)
+- Learn article: [RSMeM on ModelScope Learn](https://modelscope.cn/learn/435887)
 - Full article source: [`LEARN_ARTICLE.md`](LEARN_ARTICLE.md)
 
 RSMeM combines Hierarchical Knowledge Grounding (HKG) and Failure-Aware
@@ -72,8 +72,12 @@ reflector or next planner. For uploads, the Teacher Failure Gate has no answer
 key and provides advisory evidence only; the user's decision is authoritative.
 
 The hosted Studio accepts optional `.tif`/`.tiff` uploads and recognizes common
-band names such as `B4_red`, `B5_nir`, `B6_swir1`, and `B7_swir2`. If no files
-are uploaded, visitors can run one of thirteen bundled demonstrations:
+band names such as `B4_red`, `B5_nir`, `B6_swir1`, and `B7_swir2`. Single-band
+files are safest because raster calculations read band 1. JPG, PNG, NetCDF,
+and HDF are not accepted by this CPU deployment. The separate GPU perception
+services in the full RSMeM repository can process ordinary image inputs, but
+they are intentionally not connected here. If no files are uploaded, visitors
+can run one of thirteen bundled demonstrations:
 
 1. Sichuan agricultural drought: NDVI + LST → TVDI → dry-area ratio.
 2. California wildfire trend: 11 paired dates → NBR means → Sen's slope.

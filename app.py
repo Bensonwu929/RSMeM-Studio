@@ -66,8 +66,7 @@ PROJECT_ABSTRACT = (
     "models without storing API credentials."
 )
 GITHUB_URL = "https://github.com/AI9Stars/RSMeM"
-# Filled by the team leader after publishing LEARN_ARTICLE.md on ModelScope Learn.
-LEARN_URL = ""
+LEARN_URL = "https://modelscope.cn/learn/435887"
 DEFAULT_BASE_URL = "https://uni-api.cstcloud.cn/v1"
 DEFAULT_MODEL = "deepseek-v4-flash-aistar"
 
@@ -1243,7 +1242,6 @@ def start_interactive_workflow(
 def _attempts_interactive_markdown(state: dict) -> str:
     sections = []
     for attempt in state.get("attempts", []):
-        evaluation = attempt["evaluation"]
         section = [
             f"### Attempt {attempt['attempt']}",
             f"**Context:** HKG = yes · selected FAM = {'yes' if attempt['context']['far_memory'] else 'no'}",
@@ -1268,8 +1266,6 @@ def _attempts_interactive_markdown(state: dict) -> str:
         section.extend([
             "\n#### Answer synthesized from tool evidence",
             attempt["answer"],
-            "\n#### Evaluation",
-            f"**{evaluation.get('verdict', 'unknown').upper()}** · confidence `{evaluation.get('confidence', 0):.2f}`",
         ])
         sections.append("\n".join(section))
     return "\n\n---\n\n".join(sections)
@@ -1354,8 +1350,8 @@ def _render_interactive_state(state: dict):
     evaluation = latest.get("evaluation", {})
     if status == "awaiting_user_decision":
         decision = (
-            "### Your decision is authoritative\n\nThe Teacher Failure Gate has no answer key. "
-            "Accept this result or request reflection and another attempt."
+            "The Teacher Failure Gate has no answer key and only provides an advisory check. "
+            "Choose one of the two actions below; your decision is final."
         )
     elif status == "awaiting_reflection":
         decision = (
@@ -1385,14 +1381,13 @@ def _render_interactive_state(state: dict):
         _attempts_interactive_markdown(state),
         _evaluation_summary_markdown(evaluation, state.get("mode", "case")),
         decision,
+        gr.update(visible=show_decision),
         gr.update(visible=show_candidates),
         _public_candidates(state),
         gr.update(value=None),
         gr.update(value=""),
         gr.update(value=""),
         gr.update(value=""),
-        gr.update(visible=show_decision),
-        gr.update(visible=show_decision),
         final_md,
         state.get("artifacts", []),
     )
@@ -1506,6 +1501,13 @@ CSS = """
 .attempt.pass strong {color:#168243;}
 .attempt.fail {background:#fff3f1; border-color:#ef9b8e;}
 .attempt.fail strong {color:#c13b2a;}
+#custom-upload-accordion {border:1px solid #7b82f6 !important; background:#f7f7ff !important;}
+#custom-upload-accordion button,
+#custom-upload-accordion .label-wrap {font-weight:800 !important; color:#3038a8 !important;}
+#decision-panel {border:2px solid #6d72f2 !important; border-radius:14px !important; padding:16px !important; background:#f6f7ff !important;}
+#decision-panel h3 {margin-top:0 !important; color:#3038a8 !important;}
+#accept-result-button button, #accept-result-button {font-weight:800 !important;}
+#retry-result-button button, #retry-result-button {font-weight:800 !important;}
 footer {visibility: hidden;}
 """
 
@@ -1567,7 +1569,11 @@ For uploaded data, you decide whether to accept the result or try again.
             inputs=[example_input],
             outputs=[query_input, dataset_info],
         )
-        with gr.Accordion("Use your own GeoTIFF files (optional)", open=False):
+        with gr.Accordion(
+            "📤 Use your own GeoTIFF files (optional)",
+            open=False,
+            elem_id="custom-upload-accordion",
+        ):
             raster_input = gr.File(
                 label="GeoTIFF files",
                 file_count="multiple",
@@ -1575,8 +1581,10 @@ For uploaded data, you decide whether to accept the result or try again.
                 type="filepath",
             )
             gr.Markdown(
-                "Uploaded files replace the bundled case data for this run. "
-                "Recognizable band and date names improve automatic pairing."
+                "**Accepted here:** `.tif` and `.tiff` GeoTIFF files. Uploaded files replace "
+                "the bundled case data for this run. Single-band files are safest; recognizable "
+                "band and date names improve automatic pairing. JPG, PNG, NetCDF, and HDF are not "
+                "processed by this CPU deployment."
             )
         gr.Markdown("### Model connection")
         with gr.Row():
@@ -1603,14 +1611,23 @@ For uploaded data, you decide whether to accept the result or try again.
         timeline_output = gr.HTML()
         with gr.Accordion("Retrieved knowledge", open=True):
             hkg_output = gr.Markdown()
-        with gr.Accordion("Agent attempts: plan, tools, answer, and evaluation", open=True):
+        with gr.Accordion("Execution: plan, tool calls, and answer", open=True):
             attempts_output = gr.Markdown()
+        with gr.Accordion("Automated evaluation", open=True):
             evaluation_output = gr.Markdown()
-        with gr.Accordion("Accept the result or try again", open=True):
+        with gr.Group(visible=False, elem_id="decision-panel") as decision_group:
+            gr.Markdown("### 👤 Review and confirm the result")
             decision_output = gr.Markdown()
             with gr.Row():
-                accept_button = gr.Button("Accept this result and finish", visible=False)
-                reflect_button = gr.Button("This result is wrong — generate reflections", visible=False)
+                accept_button = gr.Button(
+                    "✅ Accept result and finish",
+                    variant="primary",
+                    elem_id="accept-result-button",
+                )
+                reflect_button = gr.Button(
+                    "⚠️ Result is wrong — reflect and retry",
+                    elem_id="retry-result-button",
+                )
         with gr.Group(visible=False) as candidate_group:
             gr.Markdown(
                 "### Reflection candidates\n\nAll three model candidates use the same reflector; "
@@ -1646,14 +1663,13 @@ For uploaded data, you decide whether to accept the result or try again.
             attempts_output,
             evaluation_output,
             decision_output,
+            decision_group,
             candidate_group,
             candidates_output,
             candidate_choice,
             user_diagnosis,
             user_plan,
             edited_reflection,
-            accept_button,
-            reflect_button,
             final_output,
             artifact_output,
         ]

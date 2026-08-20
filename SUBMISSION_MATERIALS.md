@@ -18,5 +18,5 @@ visitor-provided OpenAI-compatible models without storing API credentials.
 ## Public links
 
 - ModelScope Studio: https://modelscope.cn/studios/wbx929/RSMeM
-- ModelScope Learn: **pending — publish `LEARN_ARTICLE.md`, then paste its public URL here**
+- ModelScope Learn: https://modelscope.cn/learn/435887
 - Source code: https://github.com/AI9Stars/RSMeM

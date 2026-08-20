@@ -124,6 +124,52 @@ class InteractiveWorkflowTests(unittest.TestCase):
         self.assertIn("You make the final decision", summary)
         self.assertIn("lacks evidence", summary)
 
+    def test_execution_markdown_does_not_duplicate_evaluation(self):
+        state = {
+            "attempts": [{
+                "attempt": 1,
+                "context": {"far_memory": ""},
+                "tool_plan": [{"tool": "inspect_rasters", "purpose": "Inspect input"}],
+                "trajectory": [{
+                    "step": 1, "tool": "inspect_rasters", "status": "success",
+                    "observation": "one readable raster",
+                }],
+                "answer": "The raster is readable.",
+                "evaluation": {"verdict": "pass_supported", "confidence": 0.95},
+            }],
+        }
+        rendered = app._attempts_interactive_markdown(state)
+        self.assertIn("Planned tool chain", rendered)
+        self.assertIn("Answer synthesized from tool evidence", rendered)
+        self.assertNotIn("#### Evaluation", rendered)
+        self.assertNotIn("PASS_SUPPORTED", rendered)
+
+    def test_custom_result_reveals_the_whole_decision_panel(self):
+        state = {
+            "status": "awaiting_user_decision",
+            "mode": "custom",
+            "max_attempts": 10,
+            "model": "test-model",
+            "data_source": "visitor-uploaded GeoTIFFs",
+            "knowledge_markdown": "knowledge",
+            "candidates": {},
+            "artifacts": [],
+            "attempts": [{
+                "attempt": 1,
+                "context": {"far_memory": ""},
+                "tool_plan": [],
+                "trajectory": [],
+                "answer": "Supported answer.",
+                "evaluation": {
+                    "verdict": "pass_supported", "retry": False, "confidence": 0.95,
+                },
+            }],
+        }
+        rendered = app._render_interactive_state(state)
+        self.assertTrue(rendered[6]["visible"])
+        self.assertFalse(rendered[7]["visible"])
+        self.assertIn("your decision is final", rendered[5])
+
     def test_correct_case_stops_after_one_attempt_without_reflector(self):
         api = StudioApi(["correct"])
         output = self._start_case(api)
