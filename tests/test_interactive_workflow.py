@@ -94,6 +94,36 @@ class InteractiveWorkflowTests(unittest.TestCase):
         directories = {case["directory"] for case in app.EXAMPLES.values() if case["directory"]}
         self.assertEqual(directories, set(app.CASE_REFERENCES))
 
+    def test_correct_case_evaluation_is_concise_and_hides_judge_json(self):
+        summary = app._evaluation_summary_markdown({
+            "verdict": "correct",
+            "confidence": 0.95,
+            "candidate_interpretation": "internal candidate details",
+            "reference_interpretation": "internal reference details",
+            "comparison": "A long internal comparison.",
+            "reason_codes": ["correct_band_usage"],
+        }, "case")
+        self.assertIn("Correct", summary)
+        self.assertIn("95%", summary)
+        self.assertNotIn("internal", summary)
+        self.assertNotIn("reason_codes", summary)
+
+    def test_incorrect_case_summary_keeps_only_actionable_reason(self):
+        summary = app._evaluation_summary_markdown({
+            "verdict": "incorrect", "confidence": 0.8,
+            "comparison": "The reported trend direction conflicts with the reference.",
+        }, "case")
+        self.assertIn("Another attempt is needed", summary)
+        self.assertIn("trend direction", summary)
+
+    def test_teacher_gate_summary_remains_advisory(self):
+        summary = app._evaluation_summary_markdown({
+            "verdict": "retry_unsupported", "retry": True, "confidence": 0.7,
+            "root_cause": "The final answer lacks evidence from the raster output.",
+        }, "custom")
+        self.assertIn("You make the final decision", summary)
+        self.assertIn("lacks evidence", summary)
+
     def test_correct_case_stops_after_one_attempt_without_reflector(self):
         api = StudioApi(["correct"])
         output = self._start_case(api)

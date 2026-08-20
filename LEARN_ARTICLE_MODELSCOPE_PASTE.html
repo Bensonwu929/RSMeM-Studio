@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RSMeM — ModelScope Learn paste version</title>
+</head>
+<body style="max-width:920px;margin:32px auto;padding:0 28px;color:#1f2937;background:#ffffff;font-family:Arial,'Segoe UI',sans-serif;font-size:17px;line-height:1.75;">
+
+<h1 style="margin:0 0 16px;color:#173f70;font-size:36px;line-height:1.25;">
+  RSMeM: Knowledge-Enhanced Memory Evolution for Remote Sensing Agents with Systematic Evaluation
+</h1>
+
+<p style="margin:0 0 22px;color:#475569;font-size:19px;">
+  Remote-sensing agents should do more than call tools: they should understand
+  geoscience constraints, recognize when a workflow has gone wrong, and turn
+  previous failures into reusable experience. RSMeM closes this loop with
+  hierarchical domain knowledge and failure-aware memory evolution.
+</p>
+
+<p style="margin:0 0 28px;">
+  <strong>Paper:</strong> <a href="https://arxiv.org/abs/2607.24772">arXiv:2607.24772</a>
+  &nbsp;·&nbsp; <strong>Code:</strong> <a href="https://github.com/AI9Stars/RSMeM">GitHub</a>
+  &nbsp;·&nbsp; <strong>Demo:</strong> <a href="https://modelscope.cn/studios/wbx929/RSMeM">ModelScope Studio</a>
+</p>
+
+<h2 style="margin:34px 0 12px;color:#173f70;font-size:27px;">Why remote-sensing agents still fail</h2>
+
+<p>
+  Earth-observation analysis is moving from isolated predictions toward multi-step
+  tool execution. Mapping drought, estimating land-surface temperature, or detecting
+  disaster impacts requires an agent to identify the right data, respect band and
+  variable semantics, select compatible tools, preserve units, inspect intermediate
+  products, and finish the complete workflow. A single early mistake can propagate
+  through every downstream step.
+</p>
+
+<blockquote style="margin:20px 0;padding:14px 18px;border-left:4px solid #d99a20;color:#374151;">
+  <strong>A representative failure: BT10 is not LST.</strong><br />
+  Landsat 8 Band 10 can be converted to top-of-atmosphere brightness temperature
+  (BT10), but land-surface temperature (LST) additionally depends on surface
+  emissivity. An agent may produce a plausible-looking number while measuring the
+  wrong physical variable. Tool fluency alone is therefore not enough.
+</blockquote>
+
+<p>
+  General-purpose LLM agents are flexible but lack reusable remote-sensing knowledge.
+  Expert workflow templates are more reliable within their coverage, but expensive to
+  curate and difficult to adapt. Generic reflection can help after failure, yet a
+  reflector without domain grounding may diagnose the wrong cause. RSMeM addresses
+  both missing knowledge and repeated failure in one evolving memory system.
+</p>
+
+<h2 style="margin:34px 0 12px;color:#173f70;font-size:27px;">RSMeM in one figure</h2>
+
+<p style="margin:18px 0;padding:18px;border:2px dashed #94a3b8;color:#475569;text-align:center;">
+  <strong>INSERT PAPER METHOD FIGURE HERE</strong><br />
+  Use the ModelScope editor's image button to upload <code>assets/figure2.png</code>.
+</p>
+
+<p style="color:#64748b;font-size:14px;">
+  <strong>Figure 1. RSMeM workflow.</strong> An offline hierarchical knowledge base
+  supplies task-level guidance, while online failure-aware memory stores compact,
+  instance-level experience. Both streams are retrieved before the next attempt.
+</p>
+
+<p>
+  RSMeM evolves knowledge through three stages: build structured domain guidance,
+  retrieve both task knowledge and previous experience during execution, and distill
+  failed trajectories into actionable memory. The framework is model-agnostic and
+  leaves the underlying tool-using agent unchanged.
+</p>
+
+<h2 style="margin:34px 0 12px;color:#173f70;font-size:27px;">Two complementary memory streams</h2>
+
+<h3 style="margin:22px 0 8px;color:#245fa8;font-size:21px;">Stream A: Hierarchical Knowledge Grounding</h3>
+
+<p>
+  HKG retrieves a relevant Task Card before planning. The knowledge base contains three
+  high-level application domains, 12 subdomains, and 64 atomic analysis tasks. Each card
+  combines a task definition, domain constraints, and standardized execution guidance.
+</p>
+
+<p>
+  Retrieval combines semantic similarity with lexical signals from task titles, domain
+  keywords, and card content. This matters for specialist terms such as <em>TVDI</em>
+  and <em>emissivity</em>, which can be underrepresented in a general embedding space.
+</p>
+
+<h3 style="margin:22px 0 8px;color:#96630a;font-size:21px;">Stream B: Failure-Aware Experience Refinement</h3>
+
+<p>
+  FAR identifies an unreliable attempt, compresses its geospatial trace, and asks a
+  Reflection Generator to produce a concise diagnosis and recovery plan. The resulting
+  experience is stored in Failure-Aware Memory and retrieved for the next attempt.
+</p>
+
+<p>
+  Unlike static guidance, this memory is instance-specific: it records what failed,
+  which verified work should be preserved, and what the agent should do differently
+  next time.
+</p>
+
+<h2 style="margin:34px 0 12px;color:#173f70;font-size:27px;">From long logs to high-density experience</h2>
+
+<p>
+  Remote-sensing trajectories often contain long file lists, metadata dictionaries,
+  paths, and repeated tool outputs. Feeding the entire log back to a reflector is costly
+  and can obscure the decisive error. <strong>GeoTraceCompress</strong> applies
+  type-aware compression: long lists keep their first three and last two items,
+  dictionaries retain representative key-value pairs, and error messages receive a
+  larger budget. Key reasoning and failure signals remain visible.
+</p>
+
+<ol>
+  <li><strong>Critique:</strong> locate a material issue in the completed attempt.</li>
+  <li><strong>Compress:</strong> retain relevant evidence while removing geospatial I/O noise.</li>
+  <li><strong>Reflect:</strong> diagnose the earliest decisive failure and propose a local repair.</li>
+  <li><strong>Remember:</strong> write the repair into Failure-Aware Memory.</li>
+  <li><strong>Retry:</strong> replan with both HKG guidance and the latest experience.</li>
+</ol>
+
+<p>
+  The objective is not to accumulate ever-longer context. It is to transform a noisy
+  execution history into compact procedural knowledge that an agent can actually use.
+</p>
+
+<h2 style="margin:34px 0 12px;color:#173f70;font-size:27px;">Systematic evaluation on EarthBench</h2>
+
+<p>
+  RSMeM is evaluated on all 248 expert-annotated EarthBench questions, covering RGB
+  imagery, spectral data, and Earth products. Experiments use DeepSeek-V3.2, Kimi-K2,
+  Qwen3-32B, and Qwen3-8B with EarthAgent as the base tool-using system. Ground-truth
+  answers and reference tool steps are used only for evaluation and are never exposed
+  to the acting model.
+</p>
+
+<p>The evaluation measures three complementary aspects:</p>
+<ul>
+  <li><strong>Tool use:</strong> order, identity, exact matching, and workflow-prefix correctness.</li>
+  <li><strong>Outcome:</strong> end-to-end answer accuracy.</li>
+  <li><strong>Efficiency:</strong> trajectory redundancy, token cost, and experience density.</li>
+</ul>
+
+<h3 style="margin:22px 0 8px;color:#245fa8;font-size:21px;">What the results show</h3>
+
+<ul>
+  <li><strong>Consistent gains across model scales.</strong> DeepSeek-V3.2 improves from 51.82% to 57.89% outcome accuracy. Kimi-K2, Qwen3-32B, and Qwen3-8B also improve by approximately 5.7, 3.6, and 2.8 percentage points.</li>
+  <li><strong>Improvement comes from dense experience, not longer trajectories.</strong> Reflection accounts for only 0.35% of the total inference-token budget on DeepSeek-V3.2, while trajectory redundancy remains close to 1.0.</li>
+  <li><strong>HKG and FAR are complementary.</strong> HKG primarily strengthens global planning; FAR improves robustness after execution failures.</li>
+  <li><strong>Structured domain knowledge matters.</strong> RSMeM substantially outperforms generic retrieval alternatives, especially in standardized multi-step applications such as disaster management.</li>
+</ul>
+
+<h2 style="margin:34px 0 12px;color:#173f70;font-size:27px;">Case study: learning that BT10 is not LST</h2>
+
+<p>
+  One EarthBench task asks how many of 15 Landsat 8 dates over Death Valley have more
+  than half of the study area above 315 K in LST. During the first attempt, the agent
+  calls a nonexistent tool, calculates LST for only part of the time series, and then
+  drifts from the requested LST variable back to BT10. The workflow never reaches a
+  consistent final answer.
+</p>
+
+<p>
+  RSMeM preserves the valid observations but distills a precise correction: do not
+  threshold BT10 as if it were LST; run the single-channel LST inversion for all 15
+  dates using the red and near-infrared bands to estimate emissivity, then apply the
+  same threshold statistic to the complete LST series. With this experience retrieved,
+  the next attempt completes the workflow and returns the correct answer: five days.
+</p>
+
+<blockquote style="margin:20px 0;padding:14px 18px;border-left:4px solid #245fa8;color:#374151;">
+  HKG explains the governing remote-sensing principle; FAR explains how this particular
+  execution violated it. Together they convert task-level knowledge into an
+  instance-level recovery plan.
+</blockquote>
+
+<h2 style="margin:34px 0 12px;color:#173f70;font-size:27px;">Try RSMeM in the ModelScope Studio</h2>
+
+<p>
+  The public Studio turns the paper's core loop into an inspectable CPU-based workflow.
+  It includes 13 EarthBench examples spanning drought, wildfire, temperature, thermal
+  inertia, nighttime lights, vegetation, water quality, rainfall, fire radiative power,
+  and urban change. You can also upload your own GeoTIFF files.
+</p>
+
+<ol>
+  <li><strong>Choose data.</strong> Select a bundled case or upload your own GeoTIFFs.</li>
+  <li><strong>Connect a model.</strong> Enter a public OpenAI-compatible Base URL, model name, and your own API key. Credentials are request-scoped and are not stored.</li>
+  <li><strong>Run the agent.</strong> Inspect the retrieved Task Cards, plan, real CPU tool calls, observations, and derived artifacts.</li>
+  <li><strong>Review the result.</strong> Bundled cases can be checked against known answers. For uploaded data, a no-ground-truth LLM gate offers an evidence-based recommendation while you make the final decision.</li>
+  <li><strong>Refine when needed.</strong> Compare reflection candidates derived from compressed, full, and LLM-summarized trajectories—or write your own correction—then confirm the experience used for the next attempt.</li>
+</ol>
+
+<p>
+  <a href="https://modelscope.cn/studios/wbx929/RSMeM"><strong>Open the RSMeM ModelScope Studio →</strong></a>
+</p>
+
+<h2 style="margin:34px 0 12px;color:#173f70;font-size:27px;">Open-source resources</h2>
+
+<ul>
+  <li><strong>Code:</strong> <a href="https://github.com/AI9Stars/RSMeM">github.com/AI9Stars/RSMeM</a> — MIT License</li>
+  <li><strong>Paper:</strong> <a href="https://arxiv.org/abs/2607.24772">arXiv:2607.24772</a></li>
+  <li><strong>Interactive demo:</strong> <a href="https://modelscope.cn/studios/wbx929/RSMeM">modelscope.cn/studios/wbx929/RSMeM</a></li>
+  <li><strong>Dataset:</strong> <a href="https://huggingface.co/datasets/Sssunset/Earth-Bench">EarthBench on Hugging Face</a> — Apache-2.0</li>
+</ul>
+
+<p style="margin-top:32px;padding-top:18px;border-top:1px solid #cbd5e1;color:#64748b;font-size:14px;">
+  <strong>RSMeM</strong> — Knowledge grounded before action, experience distilled after failure.
+</p>
+
+</body>
+</html>

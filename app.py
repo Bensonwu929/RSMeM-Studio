@@ -414,13 +414,9 @@ Available executable CPU tool reference:
 
 def load_example(example_name: str):
     example = EXAMPLES.get(example_name, EXAMPLES[DEFAULT_EXAMPLE])
-    mode = "User-controlled validation" if example["directory"] is None else "Reference-aware case evaluation"
     return (
         example["query"],
-        f"### Selected workflow\n\n"
-        f"**What the agent must do:** {example['query']}\n\n"
-        f"**Inputs and operations:** {example['description']}\n\n"
-        f"**Evaluation mode:** {mode}",
+        f"**Included data and workflow:** {example['description']}",
     )
 
 
@@ -1308,6 +1304,44 @@ def _public_candidates(state: dict) -> dict:
     return public
 
 
+def _evaluation_summary_markdown(evaluation: dict, mode: str) -> str:
+    """Turn evaluator internals into a short, user-facing result card."""
+    if not evaluation:
+        return ""
+
+    verdict = str(evaluation.get("verdict", "unknown")).lower()
+    confidence = max(0.0, min(1.0, float(evaluation.get("confidence", 0))))
+    confidence_line = f"**Confidence:** {confidence:.0%}"
+
+    if mode == "case":
+        labels = {
+            "correct": ("✅ Correct", "The result matches the bundled case reference."),
+            "incorrect": ("❌ Another attempt is needed", "The result does not match the bundled case reference."),
+            "uncertain": ("⚠️ Evaluation is uncertain", "The judge could not verify the result confidently."),
+        }
+        title, message = labels.get(
+            verdict, ("⚠️ Evaluation unavailable", "The case result could not be classified."),
+        )
+        if verdict != "correct" and evaluation.get("comparison"):
+            message += f"\n\n**Reason:** {str(evaluation['comparison']).strip()}"
+        return f"### {title}\n\n{message}\n\n{confidence_line}"
+
+    retry = bool(evaluation.get("retry"))
+    if retry:
+        title = "⚠️ Please review this result"
+        message = "The automated check found a possible problem. You make the final decision."
+        detail = evaluation.get("root_cause") or evaluation.get("correction_guidance")
+        if detail:
+            message += f"\n\n**Possible issue:** {str(detail).strip()}"
+    elif verdict in {"pass_supported", "pass_recovered"}:
+        title = "✅ No clear problem detected"
+        message = "The automated check found sufficient supporting evidence. You make the final decision."
+    else:
+        title = "⚠️ Automated check is uncertain"
+        message = "Please inspect the result and decide whether another attempt is needed."
+    return f"### {title}\n\n{message}\n\n{confidence_line}"
+
+
 def _render_interactive_state(state: dict):
     status = state.get("status", "not_started")
     mode_label = "reference-aware built-in case" if state.get("mode") == "case" else "user-controlled upload"
@@ -1349,7 +1383,7 @@ def _render_interactive_state(state: dict):
         _interactive_timeline(state),
         state.get("knowledge_markdown", ""),
         _attempts_interactive_markdown(state),
-        evaluation,
+        _evaluation_summary_markdown(evaluation, state.get("mode", "case")),
         decision,
         gr.update(visible=show_candidates),
         _public_candidates(state),
@@ -1500,33 +1534,51 @@ Perception server is intentionally disabled in this free-CPU deployment.
         gr.Image("assets/figure1.png", label="Remote-sensing agent paradigms")
         gr.Image("assets/figure2.png", label="RSMeM workflow")
 
-    with gr.Tab("RSMeM iterative workflow"):
+    with gr.Tab("Run RSMeM"):
         gr.Markdown(
             """
-### Observe the full memory-evolution loop
+### Run RSMeM on an example or your own data
 
-The Studio retrieves query-relevant knowledge, plans a tool chain, executes real CPU raster tools,
-synthesizes an evidence-grounded answer, and then evaluates it. Bundled cases use a reference-aware
-LLM judge and stop after a correct result or three attempts. User uploads use a ground-truth-free
-Teacher Failure Gate, but the user makes the final decision and may run up to ten confirmed attempts.
+1. Select a case example, or open **Use your own GeoTIFF files** to upload your data.
+2. Review or edit the task, then enter an OpenAI-compatible API connection.
+3. Run RSMeM and inspect the knowledge, tool calls, outputs, and final answer.
 
-When another attempt is needed, compare **FTRO**, **raw full trajectory**, and **grounded LLM
-summary** reflections, or write your own diagnosis and plan. Only the option you explicitly confirm
-is written into Failure-Aware Memory.
+If a bundled result is incorrect, RSMeM will offer repair suggestions before the next attempt.
+For uploaded data, you decide whether to accept the result or try again.
             """
         )
         session_state = gr.State({})
         example_input = gr.Dropdown(
-            label="Remote-sensing workflow",
+            label="Case example",
             choices=list(EXAMPLES),
             value=DEFAULT_EXAMPLE,
         )
         dataset_info = gr.Markdown(
-            f"### Selected workflow\n\n"
-            f"**What the agent must do:** {EXAMPLES[DEFAULT_EXAMPLE]['query']}\n\n"
-            f"**Inputs and operations:** {EXAMPLES[DEFAULT_EXAMPLE]['description']}\n\n"
-            f"**Evaluation mode:** Reference-aware case evaluation"
+            f"**Included data and workflow:** {EXAMPLES[DEFAULT_EXAMPLE]['description']}"
         )
+        query_input = gr.Textbox(
+            label="Task for the agent",
+            value=EXAMPLES[DEFAULT_EXAMPLE]["query"],
+            lines=3,
+            info="You may edit the bundled task before running it.",
+        )
+        example_input.change(
+            load_example,
+            inputs=[example_input],
+            outputs=[query_input, dataset_info],
+        )
+        with gr.Accordion("Use your own GeoTIFF files (optional)", open=False):
+            raster_input = gr.File(
+                label="GeoTIFF files",
+                file_count="multiple",
+                file_types=[".tif", ".tiff"],
+                type="filepath",
+            )
+            gr.Markdown(
+                "Uploaded files replace the bundled case data for this run. "
+                "Recognizable band and date names improve automatic pairing."
+            )
+        gr.Markdown("### Model connection")
         with gr.Row():
             base_url_input = gr.Textbox(
                 label="OpenAI-compatible Base URL",
@@ -1541,39 +1593,20 @@ is written into Failure-Aware Memory.
                 info="Use the exact model identifier exposed by your provider.",
             )
         api_key_input = gr.Textbox(
-            label="Your API key (required)",
+            label="API key",
             type="password",
             placeholder="Enter your key for this request",
-            info="Required for planning and reflection. Used only for this request and never saved.",
+            info="Used for this run only and never saved by the Studio.",
         )
-        raster_input = gr.File(
-            label="Optional GeoTIFF override",
-            file_count="multiple",
-            file_types=[".tif", ".tiff"],
-            type="filepath",
-        )
-        gr.Markdown(
-            "Uploaded files override the bundled example. CPU only · files remain request-scoped."
-        )
-        query_input = gr.Textbox(
-            label="Remote-sensing task",
-            value=EXAMPLES[DEFAULT_EXAMPLE]["query"],
-            lines=3,
-        )
-        example_input.change(
-            load_example,
-            inputs=[example_input],
-            outputs=[query_input, dataset_info],
-        )
-        run_button = gr.Button("Start Attempt 1 on the real rasters", variant="primary")
+        run_button = gr.Button("Run RSMeM", variant="primary")
         api_status = gr.Markdown("⚪ Ready. No attempt runs without a valid API key.")
         timeline_output = gr.HTML()
-        with gr.Accordion("1 · Hierarchical Knowledge Grounding (HKG)", open=True):
+        with gr.Accordion("Retrieved knowledge", open=True):
             hkg_output = gr.Markdown()
-        with gr.Accordion("2–5 · Plan → real tools → answer → judge/gate", open=True):
+        with gr.Accordion("Agent attempts: plan, tools, answer, and evaluation", open=True):
             attempts_output = gr.Markdown()
-            evaluation_output = gr.JSON(label="Latest Case Judge / Teacher Failure Gate result")
-        with gr.Accordion("6 · Human decision", open=True):
+            evaluation_output = gr.Markdown()
+        with gr.Accordion("Accept the result or try again", open=True):
             decision_output = gr.Markdown()
             with gr.Row():
                 accept_button = gr.Button("Accept this result and finish", visible=False)
@@ -1601,7 +1634,7 @@ is written into Failure-Aware Memory.
             retry_button = gr.Button(
                 "Confirm this reflection and execute the next attempt", variant="primary"
             )
-        with gr.Accordion("Current result and artifacts", open=True):
+        with gr.Accordion("Result and downloads", open=True):
             final_output = gr.Markdown()
             artifact_output = gr.File(label="Download derived GeoTIFF artifacts", file_count="multiple")
 
