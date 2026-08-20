@@ -11,7 +11,7 @@ sensing agents. It combines Hierarchical Knowledge Grounding, which retrieves
 structured geoscience knowledge for tool planning, with Failure-Aware Experience
 Refinement, which converts failed trajectories into reusable execution
 constraints. The public Studio demonstrates the complete
-retrieve-plan-execute-critique-reflect-retry loop on thirteen EarthBench cases. Its
+retrieve-plan-execute-judge-reflect-confirm-retry loop on thirteen remote-sensing cases. Its
 CPU-only raster toolchain produces auditable GeoTIFF outputs and supports
 visitor-provided OpenAI-compatible models without storing API credentials.
 

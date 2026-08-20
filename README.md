@@ -24,7 +24,7 @@ framework for reliable remote sensing agents. It combines Hierarchical Knowledge
 Grounding, which retrieves structured geoscience knowledge for tool planning,
 with Failure-Aware Experience Refinement, which converts failed trajectories into
 reusable execution constraints. The public Studio demonstrates the complete
-retrieve-plan-execute-critique-reflect-retry loop on thirteen EarthBench cases. Its
+retrieve-plan-execute-judge-reflect-confirm-retry loop on thirteen remote-sensing cases. Its
 CPU-only raster toolchain produces auditable GeoTIFF outputs and supports
 visitor-provided OpenAI-compatible models without storing API credentials.
 
@@ -38,8 +38,9 @@ multi-step remote-sensing agents.
 
 This ModelScope Studio provides a CPU-friendly, executable demonstration of the
 core memory workflow. It retrieves structured domain knowledge, plans and runs
-real raster operations, applies a critic, turns failed trajectories into reusable
-constraints, and can call an OpenAI-compatible LLM API for planning/reflection.
+real raster operations, synthesizes an evidence-grounded answer, applies either a
+reference-aware case judge or a ground-truth-free Teacher Failure Gate, and lets
+the user choose which reflection enters memory.
 The full experimental framework and MCP tool stack remain available in the
 public source repository.
 
@@ -52,25 +53,27 @@ framework:
 2. Plan a short remote-sensing tool chain.
 3. Execute a constrained Index/Statistics tool subset over real GeoTIFF data and
    record tool calls, parameters, observations, and downloadable artifacts.
-4. Apply a critic to the result.
-5. On failure only, run **GeoTraceCompress** before reflection: retain the first
-   three and last two elements of long lists, retain two representative
+4. Synthesize a final answer using only real tool evidence.
+5. Evaluate bundled cases with a reference-aware LLM judge; evaluate uploads
+   with a ground-truth-free Teacher Failure Gate whose advice the user may
+   accept or override.
+6. When retrying, generate three comparable repairs: **FTRO**, **raw full
+   trajectory**, and **grounded LLM summary**. FTRO retains the first
+   three and last two elements of long lists, retains two representative
    key-value pairs from long dictionaries, and allocate a larger budget to
    error messages while preserving tool purpose.
-6. Supply only the compressed trajectory, symbolic critic diagnosis, query, and
-   retrieved knowledge to the Reflection Generator; write its reusable
-   constraint to Failure-Aware Memory.
-7. Inject both HKG and the latest reflection into the next attempt, rerun the
-   failed task, and stop after success or the attempt limit.
+7. Let the user select/edit one of those repairs or provide a fourth,
+   user-authored diagnosis and plan. Only the confirmed option enters FAM.
+8. Retry with HKG + selected FAM. Bundled cases stop after a correct judgment
+   or three attempts; uploads stop when the user accepts or after ten attempts.
 
-The critic is deliberately ground-truth-free, matching the RSMeM paper. A
-`PASS` verdict means that no supported execution or result-contract failure was
-detected; it does not mean that the Studio compared the output with a hidden
-preset answer.
+Reference answers are isolated inside the case judge and never enter the
+reflector or next planner. For uploads, the Teacher Failure Gate has no answer
+key and provides advisory evidence only; the user's decision is authoritative.
 
 The hosted Studio accepts optional `.tif`/`.tiff` uploads and recognizes common
 band names such as `B4_red`, `B5_nir`, `B6_swir1`, and `B7_swir2`. If no files
-are uploaded, visitors can run one of thirteen bundled EarthBench demonstrations:
+are uploaded, visitors can run one of thirteen bundled demonstrations:
 
 1. Sichuan agricultural drought: NDVI + LST → TVDI → dry-area ratio.
 2. California wildfire trend: 11 paired dates → NBR means → Sen's slope.

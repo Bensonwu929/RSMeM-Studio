@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import ipaddress
 import os
@@ -42,10 +43,17 @@ from cpu_tools import (
     sens_slope,
     subtract_rasters,
 )
+from workflow_logic import (
+    generate_reflection_candidates,
+    judge_builtin_case,
+    synthesize_answer,
+    teacher_failure_gate,
+)
 
 
 ROOT = Path(__file__).resolve().parent
 KB_PATH = ROOT / "knowledge_base.json"
+CASE_REFERENCE_PATH = ROOT / "case_references.json"
 
 PROJECT_TITLE = "RSMeM: Knowledge-Enhanced Memory Evolution for Remote Sensing Agents"
 PROJECT_ABSTRACT = (
@@ -53,7 +61,7 @@ PROJECT_ABSTRACT = (
     "It combines Hierarchical Knowledge Grounding, which retrieves structured geoscience knowledge "
     "for tool planning, with Failure-Aware Experience Refinement, which converts failed trajectories "
     "into reusable execution constraints. The public Studio implements the complete "
-    "retrieve-plan-execute-critique-reflect-retry loop on thirteen EarthBench cases. Its CPU-only raster "
+    "retrieve-plan-execute-judge-reflect-confirm-retry loop on thirteen remote-sensing cases. Its CPU-only raster "
     "toolchain produces auditable GeoTIFF outputs and supports visitor-provided OpenAI-compatible "
     "models without storing API credentials."
 )
@@ -64,67 +72,67 @@ DEFAULT_BASE_URL = "https://uni-api.cstcloud.cn/v1"
 DEFAULT_MODEL = "deepseek-v4-flash-aistar"
 
 EXAMPLES = {
-    "🌾 Sichuan agricultural drought (TVDI)": {
+    "🌾 Sichuan drought severity — derive TVDI and quantify severe-dryness pixels": {
         "directory": "tvdi_sichuan",
         "query": "Calculate TVDI for the Sichuan Plain agricultural area and determine the percentage of valid pixels where TVDI exceeds 0.75.",
         "description": "2 GeoTIFFs · NDVI + LST → TVDI → threshold ratio → affected area",
     },
-    "🔥 California wildfire trend (NBR)": {
+    "🔥 California burn-severity evolution — build an NBR series and estimate its trend": {
         "directory": "nbr_california",
         "query": "Using California B02 and B07 surface-reflectance images from January to March 2025, calculate NBR for every date, summarize the daily mean NBR series, and estimate its trend with Sen's slope.",
         "description": "22 GeoTIFFs · 11 paired dates → NBR series → regional means → Sen's slope",
     },
-    "🌃 Bhutan nighttime-light comparison": {
+    "🌃 Bhutan night-light change — compare June and August regional intensity": {
         "directory": "nightlights_bhutan",
         "query": "Compare Bhutan nighttime-light intensity in June and August 2024 by computing the spatial mean of each GeoTIFF, identify the lower month, and report the absolute difference.",
         "description": "2 GeoTIFFs · regional means → temporal comparison → absolute difference",
     },
-    "🌲 Black Forest cooling effect (EarthBench Q10)": {
+    "🌲 Black Forest thermal contrast — compare forest and non-vegetated land temperatures": {
         "directory": "q10_black_forest",
         "query": "Estimate land surface temperature over Germany's Black Forest from Landsat 8 Band 10, Red, and NIR; compare forest pixels (NDVI > 0.7) with non-vegetated pixels (NDVI < 0.2), quantify the temperature contrast, and determine whether a cooling effect is present.",
         "description": "3 GeoTIFFs · NDVI emissivity → single-channel LST → forest/non-vegetated temperature contrast",
     },
-    "🌡️ Cyprus thermal inertia change (EarthBench Q41)": {
+    "🌡️ Cyprus surface thermal inertia — compare two July ATI observations": {
         "directory": "q41_cyprus_ati",
         "query": "Calculate Apparent Thermal Inertia (ATI) for Cyprus on 1 and 15 July 2020 from paired daytime/nighttime brightness temperature and albedo, then report the change.",
         "description": "6 GeoTIFFs · day/night BT + albedo → ATI maps → temporal difference",
     },
-    "🌃 Mumbai nighttime-light trend (EarthBench Q102)": {
+    "🌃 Mumbai urban-light growth — estimate the 2013–2024 nighttime-light trend": {
         "directory": "q102_mumbai_lights",
         "query": "Using Mumbai January nighttime-light rasters from 2013 to 2024, compute the annual spatial means and estimate the long-term linear trend.",
         "description": "12 GeoTIFFs · annual regional means → linear trend",
     },
-    "🌱 Rosario vegetation growth (EarthBench Q108)": {
+    "🌱 Rosario vegetation dynamics — find the largest consecutive NDVI increase": {
         "directory": "q108_rosario_ndvi",
         "query": "Using Rosario vegetation-coverage rasters from January to June 2021, compute consecutive percentage changes and report the maximum increase and its date interval.",
         "description": "17 GeoTIFFs · NDVI means → consecutive percentage changes → maximum growth interval",
     },
-    "🌊 Dongting Lake turbidity episode (EarthBench Q124)": {
+    "🌊 Dongting Lake water quality — locate the most turbid three-day period": {
         "directory": "q124_dongting_turbidity",
         "query": "Calculate daily Dongting Lake turbidity from red-band surface reflectance in September 2022 and identify the most polluted consecutive three-day period.",
         "description": "29 GeoTIFFs · red reflectance → turbidity → daily means → rolling three-day maximum",
     },
-    "🌧️ Congo rainfall trend (EarthBench Q145)": {
+    "🌧️ Congo Rainforest precipitation — estimate May rainfall level and trend": {
         "directory": "q145_congo_rainfall",
         "query": "Calculate daily mean precipitation over the Congo Rainforest during May 2025 and estimate whether rainfall increased or decreased over the month.",
         "description": "30 GeoTIFFs · daily precipitation means → monthly average → linear trend",
     },
-    "🧪 Lake Urmia turbidity anomalies (EarthBench Q156)": {
+    "🧪 Lake Urmia turbidity anomalies — diagnose right-skewed pollution events": {
         "directory": "q156_urmia_turbidity",
         "query": "Calculate Lake Urmia turbidity throughout 2022 and use distribution skewness to assess whether the time series contains asymmetric high-turbidity anomalies.",
         "description": "24 GeoTIFFs · red reflectance → turbidity maps → means and pixel-distribution skewness",
     },
-    "🔥 California fire-hotspot direction (EarthBench Q161)": {
+    "🔥 California fire-hotspot geography — determine the dominant hotspot direction": {
         "directory": "q161_california_hotspots",
         "query": "Calculate California NBR from January to March 2025, identify fire hotspots where NBR is below -0.3, and determine their dominant general direction.",
         "description": "22 GeoTIFFs · paired NIR/SWIR → NBR → low-NBR masks → hotspot direction",
     },
-    "🚒 Thailand fire-prone zones (EarthBench Q180)": {
+    "🚒 Thailand fire-risk mapping — derive an August MaxFRP hotspot mask": {
         "directory": "q180_thailand_frp",
         "query": "Combine Thailand daily MaxFRP rasters for August 2018 and map the most fire-prone areas using the upper quartile of positive fire radiative power.",
         "description": "30 GeoTIFFs · MaxFRP maximum composite → positive-pixel percentile → fire-prone area",
     },
-    "🏙️ Shanghai residential volume trend (EarthBench Q187)": {
+    "🏙️ Shanghai residential development — derive and trend building volume": {
         "directory": "q187_shanghai_volume",
         "query": "Derive Shanghai residential building volume as total minus non-residential volume for 1985–2020, then estimate its long-term linear trend.",
         "description": "16 GeoTIFFs · year-paired subtraction → residential-volume maps → regional means → trend",
@@ -178,6 +186,8 @@ def load_entries() -> list[dict]:
 
 
 KB_ENTRIES = load_entries()
+with CASE_REFERENCE_PATH.open("r", encoding="utf-8") as handle:
+    CASE_REFERENCES = json.load(handle)
 
 
 def tokens(text: str) -> set[str]:
@@ -404,7 +414,14 @@ Available executable CPU tool reference:
 
 def load_example(example_name: str):
     example = EXAMPLES.get(example_name, EXAMPLES[DEFAULT_EXAMPLE])
-    return example["query"], f"**Dataset:** {example['description']}"
+    mode = "User-controlled validation" if example["directory"] is None else "Reference-aware case evaluation"
+    return (
+        example["query"],
+        f"### Selected workflow\n\n"
+        f"**What the agent must do:** {example['query']}\n\n"
+        f"**Inputs and operations:** {example['description']}\n\n"
+        f"**Evaluation mode:** {mode}",
+    )
 
 
 def prepare_rasters(uploaded_files, run_dir: Path, example_name: str) -> tuple[list[str], str]:
@@ -420,7 +437,7 @@ def prepare_rasters(uploaded_files, run_dir: Path, example_name: str) -> tuple[l
         directory = ROOT / "examples" / example["directory"]
         bundled = sorted(str(path.resolve()) for path in directory.glob("*.tif"))
         if bundled:
-            return bundled, f"bundled EarthBench example: {example_name}"
+            return bundled, f"bundled remote-sensing case: {example_name}"
     raise gr.Error("Custom GeoTIFF mode requires at least one uploaded .tif or .tiff file.")
 
 
@@ -1066,6 +1083,376 @@ def run_rsmem_loop(
     )
 
 
+def _retrieve_for_session(query: str) -> tuple[str, str, list[dict]]:
+    markdown, context, records = [], [], []
+    for index, (score, entry) in enumerate(retrieve_knowledge(query), start=1):
+        excerpt = re.sub(r"\s+", " ", entry["summary"]).strip()[:420]
+        markdown.append(
+            f"**{index}. {entry['domain']} → {entry['application']}**  \n"
+            f"Retrieval score: `{score}`  \n{excerpt}..."
+        )
+        context.append(
+            f"Domain: {entry['domain']} | Task: {entry['application']} | Guidance: {excerpt}"
+        )
+        records.append({"domain": entry["domain"], "task": entry["application"], "score": score})
+    return "\n\n".join(markdown), "\n".join(context), records
+
+
+def _ftro_candidate_view(trajectory: list[dict]) -> dict:
+    return geotrace_compress(trajectory)
+
+
+def _reflection_trace(attempt: dict) -> list[dict]:
+    """Include the answer-synthesis decision in every reflector evidence arm."""
+    trajectory = copy.deepcopy(attempt["trajectory"])
+    trajectory.append(
+        {
+            "step": len(trajectory) + 1,
+            "tool": "answer_synthesizer",
+            "purpose": "Form the final answer using only verified tool evidence.",
+            "parameters": {},
+            "status": "success",
+            "observation": attempt["answer"],
+        }
+    )
+    return trajectory
+
+
+def _execute_interactive_attempt(state: dict, api_key: str) -> dict:
+    attempt_number = len(state["attempts"]) + 1
+    memory = state["memory"][-1]["reflection"] if state["memory"] else ""
+    plan = plan_toolchain(
+        state["query"], state["knowledge_context"], memory,
+        api_key, state["base_url"], state["model"],
+    )
+    trajectory, executor_success, executor_reasons, executor_result, artifacts = execute_cpu_tools(
+        plan, state["raster_paths"], Path(state["run_dir"]), attempt_number
+    )
+    answer = synthesize_answer(
+        api_call=api_completion, api_key=api_key,
+        base_url=state["base_url"], model=state["model"],
+        query=state["query"], trajectory=trajectory,
+        execution_result=executor_result,
+    )
+
+    if state["mode"] == "case":
+        evaluation = judge_builtin_case(
+            api_call=api_completion, api_key=api_key,
+            base_url=state["base_url"], model=state["model"],
+            query=state["query"], reference=state["reference"],
+            trajectory=trajectory, final_answer=answer,
+        )
+        correct = evaluation["verdict"] == "correct"
+    else:
+        evaluation = teacher_failure_gate(
+            api_call=api_completion, api_key=api_key,
+            base_url=state["base_url"], model=state["model"],
+            query=state["query"], trajectory=trajectory, final_answer=answer,
+        )
+        correct = None
+
+    state["attempts"].append(
+        {
+            "attempt": attempt_number,
+            "context": {"hkg": True, "far_memory": bool(memory)},
+            "tool_plan": plan,
+            "trajectory": trajectory,
+            "executor": {
+                "success": executor_success,
+                "reasons": executor_reasons,
+                "result": executor_result,
+            },
+            "answer": answer,
+            "evaluation": evaluation,
+        }
+    )
+    state["artifacts"] = sorted(set(state["artifacts"] + artifacts))
+    state["candidates"] = {}
+
+    if state["mode"] == "case":
+        if correct:
+            state["status"] = "completed_case_correct"
+        elif attempt_number >= state["max_attempts"]:
+            state["status"] = "max_attempts_reached"
+        else:
+            state["candidates"] = generate_reflection_candidates(
+                api_call=api_completion, api_key=api_key,
+                base_url=state["base_url"], model=state["model"],
+                query=state["query"], knowledge_context=state["knowledge_context"],
+                trajectory=_reflection_trace(state["attempts"][-1]),
+                ftro_builder=_ftro_candidate_view,
+            )
+            state["status"] = "awaiting_reflection"
+    else:
+        state["status"] = (
+            "max_attempts_reached"
+            if attempt_number >= state["max_attempts"]
+            else "awaiting_user_decision"
+        )
+    return state
+
+
+def start_interactive_workflow(
+    query: str,
+    example_name: str,
+    uploaded_files,
+    requested_base_url: str,
+    requested_model: str,
+    user_api_key: str,
+):
+    query = query.strip()
+    if not query:
+        raise gr.Error("A remote-sensing task is required.")
+    api_key = user_api_key.strip() or os.getenv("RSMEM_API_KEY", "")
+    if not api_key:
+        raise gr.Error("API key is required; the Studio has no preset planner or judge.")
+    try:
+        base_url = validate_base_url(requested_base_url or DEFAULT_BASE_URL)
+    except ValueError as exc:
+        raise gr.Error(f"Invalid Base URL: {exc}") from exc
+    model = requested_model.strip() or DEFAULT_MODEL
+    example = EXAMPLES.get(example_name, EXAMPLES[DEFAULT_EXAMPLE])
+    run_dir = Path(tempfile.mkdtemp(prefix="rsmem_interactive_"))
+    raster_paths, source = prepare_rasters(uploaded_files, run_dir, example_name)
+    custom = bool(uploaded_files) or example["directory"] is None
+    hkg_md, hkg_context, retrieved = _retrieve_for_session(query)
+    reference = None if custom else CASE_REFERENCES[example["directory"]]
+    state = {
+        "status": "running",
+        "mode": "custom" if custom else "case",
+        "max_attempts": 10 if custom else 3,
+        "example_name": example_name,
+        "query": query,
+        "data_source": source,
+        "run_dir": str(run_dir),
+        "raster_paths": raster_paths,
+        "base_url": base_url,
+        "model": model,
+        "knowledge_markdown": hkg_md,
+        "knowledge_context": hkg_context,
+        "retrieved": retrieved,
+        "reference": reference,
+        "attempts": [],
+        "memory": [],
+        "candidates": {},
+        "artifacts": [],
+    }
+    try:
+        state = _execute_interactive_attempt(state, api_key)
+    except Exception as exc:
+        raise gr.Error(f"Attempt 1 failed: {exc}") from exc
+    return (state, *_render_interactive_state(state))
+
+
+def _attempts_interactive_markdown(state: dict) -> str:
+    sections = []
+    for attempt in state.get("attempts", []):
+        evaluation = attempt["evaluation"]
+        section = [
+            f"### Attempt {attempt['attempt']}",
+            f"**Context:** HKG = yes · selected FAM = {'yes' if attempt['context']['far_memory'] else 'no'}",
+            "\n#### Planned tool chain",
+            "| Step | Tool | Purpose |",
+            "|---:|---|---|",
+        ]
+        for index, step in enumerate(attempt["tool_plan"], 1):
+            section.append(
+                f"| {index} | `{step['tool']}` | {str(step['purpose']).replace('|', '\\|')} |"
+            )
+        section.extend([
+            "\n#### Real execution trajectory",
+            "| Step | Tool | Status | Observation |",
+            "|---:|---|---|---|",
+        ])
+        for step in attempt["trajectory"]:
+            observation = str(step["observation"]).replace("|", "\\|")
+            section.append(
+                f"| {step['step']} | `{step['tool']}` | {step['status']} | {observation} |"
+            )
+        section.extend([
+            "\n#### Answer synthesized from tool evidence",
+            attempt["answer"],
+            "\n#### Evaluation",
+            f"**{evaluation.get('verdict', 'unknown').upper()}** · confidence `{evaluation.get('confidence', 0):.2f}`",
+        ])
+        sections.append("\n".join(section))
+    return "\n\n---\n\n".join(sections)
+
+
+def _interactive_timeline(state: dict) -> str:
+    attempt_cards = []
+    for attempt in state.get("attempts", []):
+        verdict = str(attempt["evaluation"].get("verdict", "unknown"))
+        passed = verdict in {"correct", "pass_supported", "pass_recovered"}
+        attempt_cards.append(
+            f'<div class="attempt {"pass" if passed else "fail"}">'
+            f'<b>Attempt {attempt["attempt"]}</b><span>{len(attempt["tool_plan"])} real tools</span>'
+            f'<strong>{verdict.upper()}</strong></div>'
+        )
+    stages = [
+        ("1", "HKG", "knowledge"), ("2", "Plan", "LLM tool chain"),
+        ("3", "Execute", "real CPU tools"), ("4", "Answer", "evidence synthesis"),
+        ("5", "Judge", "reference or teacher gate"), ("6", "Human", "confirm or retry"),
+    ]
+    cards = "".join(
+        f'<div class="stage done"><span>{n}</span><b>{name}</b><small>{detail}</small></div>'
+        for n, name, detail in stages
+    )
+    return f'<div class="pipeline">{cards}</div><div class="attempts">{"".join(attempt_cards)}</div>'
+
+
+def _public_candidates(state: dict) -> dict:
+    public = {}
+    for name, candidate in state.get("candidates", {}).items():
+        public[name] = {key: value for key, value in candidate.items() if key != "evidence"}
+    return public
+
+
+def _render_interactive_state(state: dict):
+    status = state.get("status", "not_started")
+    mode_label = "reference-aware built-in case" if state.get("mode") == "case" else "user-controlled upload"
+    status_md = (
+        f"### Workflow status: `{status}`\n\n"
+        f"Mode: **{mode_label}** · Attempt {len(state.get('attempts', []))}/{state.get('max_attempts', '?')} · "
+        f"Model: `{state.get('model', '')}`"
+    )
+    latest = state["attempts"][-1] if state.get("attempts") else {}
+    evaluation = latest.get("evaluation", {})
+    if status == "awaiting_user_decision":
+        decision = (
+            "### Your decision is authoritative\n\nThe Teacher Failure Gate has no answer key. "
+            "Accept this result or request reflection and another attempt."
+        )
+    elif status == "awaiting_reflection":
+        decision = (
+            "### Reflection required\n\nCompare the three model-generated repairs or write your own. "
+            "Nothing is written to FAM until you confirm one option."
+        )
+    elif status == "completed_case_correct":
+        decision = "### Completed\n\nThe reference-aware judge found the result semantically correct."
+    elif status == "completed_user_accepted":
+        decision = "### Completed\n\nThe user accepted the current result."
+    elif status == "max_attempts_reached":
+        decision = "### Stopped\n\nThe configured attempt limit has been reached."
+    else:
+        decision = ""
+
+    show_decision = status == "awaiting_user_decision"
+    show_candidates = status == "awaiting_reflection"
+    final_answer = latest.get("answer", "")
+    final_md = (
+        f"### Current result\n\n{final_answer}\n\n"
+        f"**Data source:** {state.get('data_source', '')}"
+    )
+    return (
+        status_md,
+        _interactive_timeline(state),
+        state.get("knowledge_markdown", ""),
+        _attempts_interactive_markdown(state),
+        evaluation,
+        decision,
+        gr.update(visible=show_candidates),
+        _public_candidates(state),
+        gr.update(value=None),
+        gr.update(value=""),
+        gr.update(value=""),
+        gr.update(value=""),
+        gr.update(visible=show_decision),
+        gr.update(visible=show_decision),
+        final_md,
+        state.get("artifacts", []),
+    )
+
+
+def accept_custom_result(state: dict):
+    if not state or state.get("mode") != "custom" or state.get("status") != "awaiting_user_decision":
+        raise gr.Error("There is no custom-upload result awaiting acceptance.")
+    updated = copy.deepcopy(state)
+    updated["status"] = "completed_user_accepted"
+    return (updated, *_render_interactive_state(updated))
+
+
+def request_custom_reflections(state: dict, user_api_key: str):
+    if not state or state.get("mode") != "custom" or state.get("status") != "awaiting_user_decision":
+        raise gr.Error("Reflection can only be requested for the current custom-upload result.")
+    api_key = user_api_key.strip() or os.getenv("RSMEM_API_KEY", "")
+    if not api_key:
+        raise gr.Error("API key is required to generate reflection candidates.")
+    updated = copy.deepcopy(state)
+    latest = updated["attempts"][-1]
+    try:
+        updated["candidates"] = generate_reflection_candidates(
+            api_call=api_completion, api_key=api_key,
+            base_url=updated["base_url"], model=updated["model"],
+            query=updated["query"], knowledge_context=updated["knowledge_context"],
+            trajectory=_reflection_trace(latest), ftro_builder=_ftro_candidate_view,
+        )
+    except Exception as exc:
+        raise gr.Error(f"Reflection generation failed: {exc}") from exc
+    updated["status"] = "awaiting_reflection"
+    return (updated, *_render_interactive_state(updated))
+
+
+def select_reflection_candidate(
+    selection: str, state: dict, user_diagnosis: str, user_plan: str
+) -> str:
+    if selection == "User-authored":
+        diagnosis = user_diagnosis.strip()
+        plan = user_plan.strip()
+        return (
+            f"Failure diagnosis: {diagnosis}\nNext-attempt plan: {plan}"
+            if diagnosis or plan else ""
+        )
+    candidate = (state or {}).get("candidates", {}).get(selection, {})
+    return str(candidate.get("reflection", "")) if candidate.get("status") == "ok" else ""
+
+
+def confirm_reflection_and_retry(
+    state: dict,
+    selection: str,
+    edited_reflection: str,
+    user_diagnosis: str,
+    user_plan: str,
+    user_api_key: str,
+):
+    if not state or state.get("status") != "awaiting_reflection":
+        raise gr.Error("No reflection decision is currently pending.")
+    if len(state["attempts"]) >= state["max_attempts"]:
+        raise gr.Error("The attempt limit has already been reached.")
+    api_key = user_api_key.strip() or os.getenv("RSMEM_API_KEY", "")
+    if not api_key:
+        raise gr.Error("API key is required for the next attempt.")
+    reflection = edited_reflection.strip()
+    if selection == "User-authored":
+        if not user_diagnosis.strip() or not user_plan.strip():
+            raise gr.Error("Provide both your error diagnosis and next-attempt plan.")
+        reflection = (
+            f"Failure diagnosis: {user_diagnosis.strip()}\n"
+            f"Next-attempt plan: {user_plan.strip()}"
+        )
+    if not selection or not reflection:
+        raise gr.Error("Select a successful candidate and confirm a non-empty reflection.")
+    if selection != "User-authored":
+        candidate = state["candidates"].get(selection, {})
+        if candidate.get("status") != "ok":
+            raise gr.Error("The selected model-generated candidate is unavailable.")
+
+    updated = copy.deepcopy(state)
+    updated["memory"].append(
+        {
+            "source_attempt": len(state["attempts"]),
+            "source": selection,
+            "reflection": reflection,
+        }
+    )
+    updated["status"] = "running"
+    try:
+        updated = _execute_interactive_attempt(updated, api_key)
+    except Exception as exc:
+        raise gr.Error(f"Next attempt failed: {exc}") from exc
+    return (updated, *_render_interactive_state(updated))
+
+
 CSS = """
 .hero {text-align:center; padding: 1rem 0 0.4rem 0;}
 .hero h1 {margin-bottom: .35rem;}
@@ -1100,10 +1487,10 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
             """
 RSMeM combines **Hierarchical Knowledge Grounding (HKG)** with
 **Failure-Aware Experience Refinement (FAR)**. HKG retrieves structured
-geoscience guidance for planning and tool selection. After a genuine execution
-failure, **GeoTraceCompress** first performs type-aware trajectory compression;
-the Reflection Generator then converts that evidence into a compact, reusable
-constraint stored in Failure-Aware Memory.
+geoscience guidance for planning and tool selection. When a case judge or user
+requests another attempt, the Studio compares FTRO, raw full-trajectory, and
+grounded-summary reflections. Only the user's confirmed repair is stored in
+Failure-Aware Memory.
 
 This public Studio combines transparent knowledge retrieval with a required
 OpenAI-compatible LLM planner and a real CPU raster executor. The GPU-backed
@@ -1118,23 +1505,28 @@ Perception server is intentionally disabled in this free-CPU deployment.
             """
 ### Observe the full memory-evolution loop
 
-The Studio retrieves query-relevant knowledge, plans a tool chain, executes it in a transparent
-**CPU runtime**, evaluates the result, and conditionally reflects and retries. Upload GeoTIFF
-bands with recognizable names such as `B4_red`, `B5_nir`, `B6_swir1`, or `B7_swir2`.
-Choose one of thirteen bundled EarthBench cases, or switch to custom upload. An API key is
-required for model-authored planning; the raster tools themselves run locally on CPU.
+The Studio retrieves query-relevant knowledge, plans a tool chain, executes real CPU raster tools,
+synthesizes an evidence-grounded answer, and then evaluates it. Bundled cases use a reference-aware
+LLM judge and stop after a correct result or three attempts. User uploads use a ground-truth-free
+Teacher Failure Gate, but the user makes the final decision and may run up to ten confirmed attempts.
 
-> **Critic semantics:** as in the paper, the critic has no ground-truth label. `PASS` means that
-> no supported execution or result-contract failure was detected; it is not a comparison with a
-> hidden preset answer.
+When another attempt is needed, compare **FTRO**, **raw full trajectory**, and **grounded LLM
+summary** reflections, or write your own diagnosis and plan. Only the option you explicitly confirm
+is written into Failure-Aware Memory.
             """
         )
+        session_state = gr.State({})
         example_input = gr.Dropdown(
-            label="EarthBench example",
+            label="Remote-sensing workflow",
             choices=list(EXAMPLES),
             value=DEFAULT_EXAMPLE,
         )
-        dataset_info = gr.Markdown(f"**Dataset:** {EXAMPLES[DEFAULT_EXAMPLE]['description']}")
+        dataset_info = gr.Markdown(
+            f"### Selected workflow\n\n"
+            f"**What the agent must do:** {EXAMPLES[DEFAULT_EXAMPLE]['query']}\n\n"
+            f"**Inputs and operations:** {EXAMPLES[DEFAULT_EXAMPLE]['description']}\n\n"
+            f"**Evaluation mode:** Reference-aware case evaluation"
+        )
         with gr.Row():
             base_url_input = gr.Textbox(
                 label="OpenAI-compatible Base URL",
@@ -1173,25 +1565,67 @@ required for model-authored planning; the raster tools themselves run locally on
             inputs=[example_input],
             outputs=[query_input, dataset_info],
         )
-        run_button = gr.Button("Run RSMeM on the actual rasters", variant="primary")
-        api_status = gr.Markdown("⚪ Ready. A valid API key is required; no preset planner is used.")
+        run_button = gr.Button("Start Attempt 1 on the real rasters", variant="primary")
+        api_status = gr.Markdown("⚪ Ready. No attempt runs without a valid API key.")
         timeline_output = gr.HTML()
         with gr.Accordion("1 · Hierarchical Knowledge Grounding (HKG)", open=True):
             hkg_output = gr.Markdown()
-        with gr.Accordion("2–4 · Planning, real CPU tool execution, and critic", open=True):
+        with gr.Accordion("2–5 · Plan → real tools → answer → judge/gate", open=True):
             attempts_output = gr.Markdown()
-            with gr.Accordion("Raw structured trace", open=False):
-                trace_output = gr.JSON(label="Multi-attempt execution trace")
-        with gr.Accordion("5 · GeoTraceCompress → Reflection Generator → FAM", open=True):
-            compression_output = gr.JSON(
-                label="Exact compressed trajectory supplied to the Reflection Generator"
+            evaluation_output = gr.JSON(label="Latest Case Judge / Teacher Failure Gate result")
+        with gr.Accordion("6 · Human decision", open=True):
+            decision_output = gr.Markdown()
+            with gr.Row():
+                accept_button = gr.Button("Accept this result and finish", visible=False)
+                reflect_button = gr.Button("This result is wrong — generate reflections", visible=False)
+        with gr.Group(visible=False) as candidate_group:
+            gr.Markdown(
+                "### Reflection candidates\n\nAll three model candidates use the same reflector; "
+                "only the trajectory representation changes."
             )
-            memory_output = gr.Markdown()
-        with gr.Accordion("6 · Final aggregated result", open=True):
+            candidates_output = gr.JSON(label="Candidate comparison and provenance")
+            candidate_choice = gr.Radio(
+                choices=["FTRO", "Full trajectory", "LLM summary", "User-authored"],
+                label="Choose one reflection source",
+            )
+            with gr.Row():
+                user_diagnosis = gr.Textbox(
+                    label="Your diagnosis (required for User-authored)", lines=3
+                )
+                user_plan = gr.Textbox(
+                    label="Your next-attempt plan (required for User-authored)", lines=3
+                )
+            edited_reflection = gr.Textbox(
+                label="Final editable reflection to write into FAM", lines=6
+            )
+            retry_button = gr.Button(
+                "Confirm this reflection and execute the next attempt", variant="primary"
+            )
+        with gr.Accordion("Current result and artifacts", open=True):
             final_output = gr.Markdown()
             artifact_output = gr.File(label="Download derived GeoTIFF artifacts", file_count="multiple")
+
+        workflow_outputs = [
+            session_state,
+            api_status,
+            timeline_output,
+            hkg_output,
+            attempts_output,
+            evaluation_output,
+            decision_output,
+            candidate_group,
+            candidates_output,
+            candidate_choice,
+            user_diagnosis,
+            user_plan,
+            edited_reflection,
+            accept_button,
+            reflect_button,
+            final_output,
+            artifact_output,
+        ]
         run_button.click(
-            run_rsmem_loop,
+            start_interactive_workflow,
             inputs=[
                 query_input,
                 example_input,
@@ -1200,17 +1634,44 @@ required for model-authored planning; the raster tools themselves run locally on
                 model_input,
                 api_key_input,
             ],
-            outputs=[
-                api_status,
-                timeline_output,
-                hkg_output,
-                attempts_output,
-                trace_output,
-                compression_output,
-                memory_output,
-                final_output,
-                artifact_output,
+            outputs=workflow_outputs,
+        )
+        accept_button.click(
+            accept_custom_result,
+            inputs=[session_state],
+            outputs=workflow_outputs,
+        )
+        reflect_button.click(
+            request_custom_reflections,
+            inputs=[session_state, api_key_input],
+            outputs=workflow_outputs,
+        )
+        candidate_choice.change(
+            select_reflection_candidate,
+            inputs=[candidate_choice, session_state, user_diagnosis, user_plan],
+            outputs=[edited_reflection],
+        )
+        user_diagnosis.change(
+            select_reflection_candidate,
+            inputs=[candidate_choice, session_state, user_diagnosis, user_plan],
+            outputs=[edited_reflection],
+        )
+        user_plan.change(
+            select_reflection_candidate,
+            inputs=[candidate_choice, session_state, user_diagnosis, user_plan],
+            outputs=[edited_reflection],
+        )
+        retry_button.click(
+            confirm_reflection_and_retry,
+            inputs=[
+                session_state,
+                candidate_choice,
+                edited_reflection,
+                user_diagnosis,
+                user_plan,
+                api_key_input,
             ],
+            outputs=workflow_outputs,
         )
 
     with gr.Tab("Open-source resources"):

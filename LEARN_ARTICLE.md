@@ -1,5 +1,10 @@
 # RSMeM: Knowledge-Enhanced Memory Evolution for Remote Sensing Agents
 
+**Paper:** [arXiv abstract](https://arxiv.org/abs/2607.24772) ·
+[PDF](https://arxiv.org/pdf/2607.24772) ·
+**Code:** [GitHub](https://github.com/AI9Stars/RSMeM) ·
+**Demo:** [ModelScope Studio](https://modelscope.cn/studios/wbx929/RSMeM)
+
 ## Abstract
 
 RSMeM is a knowledge-enhanced memory evolution framework for reliable remote
@@ -7,7 +12,7 @@ sensing agents. It combines Hierarchical Knowledge Grounding, which retrieves
 structured geoscience knowledge for tool planning, with Failure-Aware Experience
 Refinement, which converts failed trajectories into reusable execution
 constraints. The public Studio demonstrates the complete
-retrieve-plan-execute-critique-reflect-retry loop on thirteen EarthBench cases. Its
+retrieve-plan-execute-judge-reflect-confirm-retry loop on thirteen remote-sensing cases. Its
 CPU-only raster toolchain produces auditable GeoTIFF outputs and supports
 visitor-provided OpenAI-compatible models without storing API credentials.
 
@@ -53,22 +58,22 @@ perception model.
 | Sichuan agricultural drought | 2 GeoTIFFs | NDVI + LST → TVDI → dryness ratio and area |
 | California wildfire trend | 22 GeoTIFFs, 11 dates | paired reflectance bands → NBR series → regional means → Sen's slope |
 | Bhutan nighttime-light comparison | 2 GeoTIFFs | spatial means → temporal comparison → absolute difference |
-| Black Forest temperature contrast (Q10) | 3 GeoTIFFs | NDVI emissivity → single-channel LST → land-cover contrast |
-| Cyprus thermal inertia (Q41) | 6 GeoTIFFs | paired day/night BT + albedo → ATI change |
-| Mumbai night-light trend (Q102) | 12 GeoTIFFs | annual means → 2013–2024 linear trend |
-| Rosario vegetation growth (Q108) | 17 GeoTIFFs | temporal means → consecutive percentage change |
-| Dongting Lake turbidity (Q124) | 29 GeoTIFFs | red reflectance → turbidity → three-day episode |
-| Congo rainfall (Q145) | 30 GeoTIFFs | daily rainfall means → monthly trend |
-| Lake Urmia turbidity (Q156) | 24 GeoTIFFs | turbidity maps → means and skewness |
-| California fire hotspots (Q161) | 22 GeoTIFFs | NBR → low-NBR masks → dominant direction |
-| Thailand fire-prone zones (Q180) | 30 GeoTIFFs | MaxFRP composite → upper-quartile mask |
-| Shanghai residential volume (Q187) | 20 GeoTIFFs | paired subtraction → 1985–2020 trend |
+| Black Forest temperature contrast | 3 GeoTIFFs | NDVI emissivity → single-channel LST → land-cover contrast |
+| Cyprus thermal inertia | 6 GeoTIFFs | paired day/night BT + albedo → ATI change |
+| Mumbai night-light trend | 12 GeoTIFFs | annual means → 2013–2024 linear trend |
+| Rosario vegetation growth | 17 GeoTIFFs | temporal means → consecutive percentage change |
+| Dongting Lake turbidity | 29 GeoTIFFs | red reflectance → turbidity → three-day episode |
+| Congo rainfall | 30 GeoTIFFs | daily rainfall means → monthly trend |
+| Lake Urmia turbidity | 24 GeoTIFFs | turbidity maps → means and skewness |
+| California fire hotspots | 22 GeoTIFFs | NBR → low-NBR masks → dominant direction |
+| Thailand fire-prone zones | 30 GeoTIFFs | MaxFRP composite → upper-quartile mask |
+| Shanghai residential volume | 20 GeoTIFFs | paired subtraction → 1985–2020 trend |
 
 Visitors may instead upload their own GeoTIFFs. Uploaded files override the
 bundled case and are used only for the current request.
 
-**Data source:** https://huggingface.co/datasets/Sssunset/Earth-Bench
-**Original project:** https://github.com/opendatalab/Earth-Agent
+**Data source:** [EarthBench](https://huggingface.co/datasets/Sssunset/Earth-Bench)  
+**Original project:** [Earth-Agent](https://github.com/opendatalab/Earth-Agent)  
 **Dataset license:** Apache-2.0
 
 ## 3. Models and knowledge resources
@@ -99,25 +104,21 @@ than returning only a final answer:
    dependencies such as raster inspection before band-dependent operations.
 3. **Execute tools.** CPU raster tools run on real GeoTIFF inputs and record their
    parameters, observations, and derived artifacts.
-4. **Critique the result.** A critic checks execution status and the final output
-   contract.
-5. **Compress failure evidence.** If the critic fails the attempt,
-   GeoTraceCompress reduces verbose geospatial tool I/O while retaining errors
-   and the execution semantics needed for diagnosis.
-6. **Reflect on failure.** The Reflection Generator sees the compressed
-   trajectory—not the complete raw log—and writes a compact reusable constraint
-   to Failure-Aware Memory.
-7. **Retry conditionally.** The next attempt receives both HKG guidance and the
-   latest FAR memory, then stops after success or the attempt limit.
+4. **Synthesize an answer.** A separate LLM summarizes only claims supported by
+   the real tool trajectory.
+5. **Evaluate the attempt.** Bundled cases use a reference-aware LLM judge;
+   uploads use a no-answer Teacher Failure Gate and wait for the user's decision.
+6. **Generate comparable repairs.** FTRO, raw full trajectory, and a grounded
+   LLM summary are passed separately through the same reflector prompt.
+7. **Confirm memory.** The user selects and may edit one model repair, or writes
+   a fourth diagnosis and plan. Only that confirmed text enters FAM.
+8. **Retry conditionally.** The next planner receives HKG plus the selected FAM.
+   Bundled cases allow three attempts and uploads allow ten user-confirmed attempts.
 
-The interface does not inject a demonstration failure. A successful first
-execution stops immediately. FAR and the second attempt appear only when a real
-tool or result-contract error occurs.
-
-The symbolic critic has no access to ground-truth labels, following the paper's
-leakage-free design. Therefore, `PASS` denotes the absence of a detected
-execution or output-contract issue, rather than agreement with a hidden preset
-answer.
+The interface does not inject a demonstration failure. Reference information is
+confined to the bundled-case judge and never enters any reflection or later
+planner prompt. For uploaded data, the Teacher Failure Gate remains
+ground-truth-free and advisory; the user makes the final accept/retry decision.
 
 ## 5. System design
 
@@ -131,9 +132,9 @@ The hosted artifact is organized into six auditable layers:
   tool registry; malformed, empty, or unsupported plans are reported as errors.
 - **CPU tool runtime:** Rasterio and NumPy implementations of selected public
   RSMeM Index, Statistics, Inversion, and Analysis semantics.
-- **Critic, GeoTraceCompress, and FAR memory:** conditional symbolic failure
-  diagnosis, visible type-aware compressed evidence, compact reflection, and
-  memory injection into the next attempt.
+- **Judge/Gate and FAR memory:** isolated case judging, an advisory no-answer
+  upload gate, three trajectory representations through one reflector, and
+  explicit user confirmation before memory injection.
 - **Safety boundary:** public HTTPS endpoint validation, blocked private or
   loopback Base URLs, request-scoped uploads, isolated temporary outputs, and no
   embedded API credentials.

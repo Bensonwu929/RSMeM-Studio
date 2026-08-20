@@ -1,0 +1,54 @@
+{
+  "tvdi_sichuan": {
+    "reference": "The TVDI raster is successfully produced. About 28.07% of valid pixels exceed TVDI 0.75, corresponding to 367090 pixels in the bundled raster. A physical area must not be claimed because this cutout lacks a projected geotransform suitable for area conversion.",
+    "rubric": "Require a TVDI computation, the 0.75 threshold, and a severe-dryness ratio close to 28.07%."
+  },
+  "nbr_california": {
+    "reference": "Eleven paired NIR/SWIR2 dates produce an NBR time series. Sen's slope is approximately 0.00336 per observation, so the overall NBR direction is slightly increasing.",
+    "rubric": "Require 11 correctly paired dates, NBR rather than NDVI, and an increasing Sen-slope conclusion."
+  },
+  "nightlights_bhutan": {
+    "reference": "Mean nighttime-light intensity is approximately 0.32277 in June 2024 and 0.41059 in August 2024. June is lower, August is higher, and the absolute difference is approximately 0.08782.",
+    "rubric": "Require both regional means, the correct lower month, and an absolute difference close to 0.08782."
+  },
+  "q10_black_forest": {
+    "reference": "The emissivity-corrected mean LST is approximately 290.94 K for forest pixels with NDVI above 0.7 and 281.97 K for non-vegetated pixels with NDVI below 0.2. In this cutout the forest subset is about 8.97 K warmer, so the computed result does not show a forest cooling effect relative to that comparison subset.",
+    "rubric": "Require the two NDVI-stratified temperatures and the observed sign of their approximately 8.97 K contrast."
+  },
+  "q41_cyprus_ati": {
+    "reference": "Mean ATI is approximately 3.656 on 1 July 2020 and 4.295 on 15 July 2020. The second date is higher by approximately 0.6391.",
+    "rubric": "Require two correctly paired day/night/albedo ATI maps and an increase of about 0.639."
+  },
+  "q102_mumbai_lights": {
+    "reference": "The 2013–2024 January nighttime-light series has an increasing linear trend. The fitted slope is approximately 0.2884 intensity units per year and the series mean is approximately 12.388.",
+    "rubric": "Require the annual regional means and a positive trend with slope close to 0.288."
+  },
+  "q108_rosario_ndvi": {
+    "reference": "The largest positive consecutive NDVI percentage increase is approximately 329.51%, occurring from 30 January 2021 to 10 February 2021.",
+    "rubric": "Require consecutive percentage changes and identify the 30 January to 10 February interval as the maximum positive increase."
+  },
+  "q124_dongting_turbidity": {
+    "reference": "The highest three-day mean turbidity interval is 21–23 September 2022, with a mean of approximately 6573.55 in the implemented turbidity units.",
+    "rubric": "Require daily turbidity maps and identify 21–23 September as the maximum three-day window."
+  },
+  "q145_congo_rainfall": {
+    "reference": "Mean daily precipitation over May 2025 is approximately 6.5466, and the fitted trend slope is approximately 0.0252 per day. The monthly direction is slightly increasing.",
+    "rubric": "Require daily regional means, a monthly mean close to 6.55, and a slightly increasing trend."
+  },
+  "q156_urmia_turbidity": {
+    "reference": "The mean pixel-distribution skewness across the 24 turbidity maps is approximately 0.5448 and the maximum is approximately 1.6166. The positive mean indicates right-skewed high-turbidity anomalies.",
+    "rubric": "Require turbidity conversion and a positive-skew interpretation supported by the reported skewness."
+  },
+  "q161_california_hotspots": {
+    "reference": "Eleven NBR dates are thresholded at NBR below -0.3. The combined hotspot mask contains 53198 active pixels and its dominant image-frame direction is west.",
+    "rubric": "Require low-NBR hotspot masks and report west as the dominant direction."
+  },
+  "q180_thailand_frp": {
+    "reference": "A maximum composite is produced from 30 daily MaxFRP rasters. Fire-prone pixels are the upper quartile of positive values, using a threshold of 115 in the bundled data.",
+    "rubric": "Require a 30-day maximum composite and the positive-pixel 75th-percentile threshold of approximately 115."
+  },
+  "q187_shanghai_volume": {
+    "reference": "Eight residential-volume maps are derived as total minus non-residential volume for 1985–2020. Their regional means show an increasing trend with fitted slope approximately 149.76 volume units per year.",
+    "rubric": "Require year-paired subtraction, eight derived maps, and an increasing trend close to 149.76 per year."
+  }
+}
