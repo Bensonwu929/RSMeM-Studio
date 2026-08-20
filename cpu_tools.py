@@ -7,13 +7,12 @@ system-level GDAL Python binding.  Rasterio supplies the GeoTIFF I/O layer.
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
 import numpy as np
 import rasterio
-from rasterio.transform import from_origin
+from rasterio.warp import Resampling
 
 
 RASTER_SUFFIXES = {".tif", ".tiff"}
@@ -62,6 +61,171 @@ def calculate_ndwi(nir_path: str, swir_path: str, output_path: str) -> str:
 
 def calculate_nbr(nir_path: str, swir2_path: str, output_path: str) -> str:
     return _normalized_difference(nir_path, swir2_path, output_path)
+
+
+def lst_single_channel(bt_path: str, red_path: str, nir_path: str, output_path: str) -> str:
+    """Estimate LST from Landsat brightness temperature and NDVI emissivity."""
+    bt, profile = _read_band(bt_path)
+    red, _ = _read_band(red_path)
+    nir, _ = _read_band(nir_path)
+    denominator = nir + red
+    ndvi = np.divide(nir - red, denominator, out=np.zeros_like(nir), where=np.abs(denominator) > 1e-6)
+    emissivity = np.where(ndvi > 0.7, 0.99, np.where(ndvi < 0.2, 0.96, 0.97 + 0.003 * ndvi))
+    wavelength = 10.9
+    c2 = 1.43877e4
+    lst = bt / (1 + (wavelength * bt / c2) * np.log(emissivity))
+    return _write_band(output_path, lst, profile)
+
+
+def mean_lst_by_ndvi(
+    red_path: str,
+    nir_path: str,
+    lst_path: str,
+    ndvi_output_path: str,
+) -> dict:
+    red, profile = _read_band(red_path)
+    nir, _ = _read_band(nir_path)
+    lst, _ = _read_band(lst_path)
+    denominator = nir + red
+    ndvi = np.divide(nir - red, denominator, out=np.zeros_like(nir), where=np.abs(denominator) > 1e-6)
+    _write_band(ndvi_output_path, ndvi, profile)
+    forest = lst[np.isfinite(lst) & np.isfinite(ndvi) & (ndvi > 0.7)]
+    nonvegetated = lst[np.isfinite(lst) & np.isfinite(ndvi) & (ndvi < 0.2)]
+    if not forest.size or not nonvegetated.size:
+        raise ValueError("NDVI masks contain too few valid forest or non-vegetated pixels.")
+    return {
+        "forest_mean_k": float(np.mean(forest)),
+        "nonvegetated_mean_k": float(np.mean(nonvegetated)),
+        "cooling_difference_k": float(np.mean(nonvegetated) - np.mean(forest)),
+        "ndvi_path": str(ndvi_output_path),
+    }
+
+
+def apparent_thermal_inertia(
+    day_temp_path: str,
+    night_temp_path: str,
+    albedo_path: str,
+    output_path: str,
+) -> str:
+    day, profile = _read_band(day_temp_path)
+
+    def aligned(path: str) -> np.ndarray:
+        with rasterio.open(path) as src:
+            # The released ATI tool normalizes width/height before calculation.
+            # These EarthBench cutouts have slightly different footprints, so
+            # pixel-grid resampling is the reproducible CPU-safe equivalent.
+            return src.read(
+                1,
+                out_shape=day.shape,
+                resampling=Resampling.bilinear,
+            ).astype(np.float32)
+
+    night = aligned(night_temp_path)
+    albedo = aligned(albedo_path)
+    delta = day - night
+    ati = np.divide(1 - albedo, delta, out=np.full_like(day, np.nan), where=np.abs(delta) > 1e-6)
+    ati = np.clip(ati, 0, 10)
+    return _write_band(output_path, ati, profile)
+
+
+def linear_trend(values: list[float], x: list[float] | None = None) -> dict:
+    if len(values) < 2:
+        raise ValueError("At least two values are required for linear trend estimation.")
+    x_values = np.arange(len(values), dtype=float) if x is None else np.asarray(x, dtype=float)
+    y_values = np.asarray(values, dtype=float)
+    if len(x_values) != len(y_values):
+        raise ValueError("Trend coordinates and values must have equal length.")
+    slope, intercept = np.polyfit(x_values, y_values, 1)
+    direction = "increasing" if slope > 0 else "decreasing" if slope < 0 else "stable"
+    return {"slope": float(slope), "intercept": float(intercept), "direction": direction}
+
+
+def consecutive_percentage_changes(values: list[float]) -> list[float]:
+    changes = []
+    for previous, current in zip(values, values[1:]):
+        changes.append(float((current - previous) / previous * 100) if abs(previous) > 1e-12 else float("nan"))
+    return changes
+
+
+def calculate_turbidity(input_red_path: str, output_path: str) -> str:
+    red, profile = _read_band(input_red_path)
+    return _write_band(output_path, np.maximum(red, 0), profile)
+
+
+def raster_skewness(path: str) -> float:
+    image, _ = _read_band(path)
+    values = image[np.isfinite(image)].astype(np.float64)
+    if values.size < 3:
+        raise ValueError("At least three finite pixels are required for skewness.")
+    centered = values - np.mean(values)
+    variance = np.mean(centered**2)
+    return float(np.mean(centered**3) / variance**1.5) if variance > 0 else 0.0
+
+
+def subtract_rasters(first_path: str, second_path: str, output_path: str) -> str:
+    first, profile = _read_band(first_path)
+    second, _ = _read_band(second_path)
+    if first.shape != second.shape:
+        raise ValueError("Raster subtraction requires matching grids.")
+    return _write_band(output_path, first - second, profile)
+
+
+def maximum_composite(paths: list[str], output_path: str) -> str:
+    if not paths:
+        raise ValueError("A maximum composite requires at least one raster.")
+    first, profile = _read_band(paths[0])
+    stack = [first]
+    for path in paths[1:]:
+        image, _ = _read_band(path)
+        if image.shape != first.shape:
+            raise ValueError("Composite inputs must share a raster grid.")
+        stack.append(image)
+    stacked = np.stack(stack)
+    finite = np.isfinite(stacked)
+    composite = np.max(np.where(finite, stacked, -np.inf), axis=0)
+    composite[~np.any(finite, axis=0)] = np.nan
+    return _write_band(output_path, composite, profile)
+
+
+def create_below_threshold_mask(image_path: str, threshold: float, output_path: str) -> str:
+    image, profile = _read_band(image_path)
+    mask = (np.isfinite(image) & (image < threshold)).astype(np.float32)
+    return _write_band(output_path, mask, profile)
+
+
+def combine_binary_masks(paths: list[str], output_path: str) -> str:
+    if not paths:
+        raise ValueError("At least one mask is required.")
+    first, profile = _read_band(paths[0])
+    combined = first > 0
+    for path in paths[1:]:
+        image, _ = _read_band(path)
+        combined |= image > 0
+    return _write_band(output_path, combined.astype(np.float32), profile)
+
+
+def hotspot_direction(mask_path: str) -> dict:
+    mask, _ = _read_band(mask_path)
+    active = np.argwhere(mask > 0)
+    if not active.size:
+        return {"direction": "none", "counts": {"north": 0, "south": 0, "west": 0, "east": 0}}
+    height, width = mask.shape
+    counts = {
+        "north": int(np.sum(active[:, 0] < height / 2)),
+        "south": int(np.sum(active[:, 0] >= height / 2)),
+        "west": int(np.sum(active[:, 1] < width / 2)),
+        "east": int(np.sum(active[:, 1] >= width / 2)),
+    }
+    direction = max(counts, key=counts.get)
+    return {"direction": direction, "counts": counts, "active_pixels": int(len(active))}
+
+
+def fire_prone_mask(image_path: str, output_path: str, percentile: float = 75) -> tuple[str, float]:
+    image, profile = _read_band(image_path)
+    positive = image[np.isfinite(image) & (image > 0)]
+    threshold = float(np.percentile(positive, percentile)) if positive.size else 0.0
+    mask = (np.isfinite(image) & (image >= threshold) & (image > 0)).astype(np.float32)
+    return _write_band(output_path, mask, profile), threshold
 
 
 def compute_tvdi(ndvi_path: str, lst_path: str, output_path: str) -> str:
@@ -183,39 +347,3 @@ def infer_band_roles(paths: list[str]) -> dict[str, str]:
             if role not in roles and any(re.search(pattern, name) for pattern in role_patterns):
                 roles[role] = path
     return roles
-
-
-def create_demo_scene(directory: str | Path) -> list[str]:
-    """Create a deterministic CPU demo scene when the visitor uploads no data."""
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    y, x = np.mgrid[:128, :128]
-    water = ((x - 64) ** 2 / 40**2 + (y - 66) ** 2 / 27**2) < 1
-    texture = 0.015 * np.sin(x / 7) * np.cos(y / 9)
-    bands = {
-        "scene_B3_green.tif": np.where(water, 0.13, 0.16) + texture,
-        "scene_B4_red.tif": np.where(water, 0.07, 0.20) + texture,
-        "scene_B5_nir.tif": np.where(water, 0.05, 0.42) + texture,
-        "scene_B6_swir1.tif": np.where(water, 0.02, 0.38) + texture,
-        "scene_B7_swir2.tif": np.where(water, 0.015, 0.23) + texture,
-    }
-    profile = {
-        "driver": "GTiff",
-        "height": 128,
-        "width": 128,
-        "count": 1,
-        "dtype": "float32",
-        "crs": "EPSG:32650",
-        "transform": from_origin(500000, 4000000, 10, 10),
-        "compress": "lzw",
-    }
-    paths = []
-    for name, data in bands.items():
-        path = directory / name
-        _write_band(path, data.astype(np.float32), profile)
-        paths.append(str(path))
-    (directory / "scene_manifest.json").write_text(
-        json.dumps({"source": "synthetic demonstration", "bands": [Path(p).name for p in paths]}, indent=2),
-        encoding="utf-8",
-    )
-    return paths
