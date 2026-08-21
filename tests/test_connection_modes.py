@@ -82,17 +82,13 @@ class ConnectionResolutionTests(unittest.TestCase):
     def test_modelscope_mode_without_sign_in_blocks_execution(self):
         with patch.dict(os.environ, OAUTH_ENV):
             with self.assertRaises(gr.Error) as ctx:
-                app._resolve_connection(
-                    app.MODE_MODELSCOPE, "", "", "", "", FakeRequest()
-                )
+                app._resolve_connection(app.MODE_MODELSCOPE, "", "", "", "", None)
         self.assertIn("Sign in with ModelScope", str(ctx.exception))
 
     def test_unconfigured_modelscope_mode_blocks_execution(self):
         with patch.dict(os.environ, {"OAUTH_CLIENT_ID": "", "OAUTH_CLIENT_SECRET": ""}):
             with self.assertRaises(gr.Error) as ctx:
-                app._resolve_connection(
-                    app.MODE_MODELSCOPE, "", "", "", "", FakeRequest()
-                )
+                app._resolve_connection(app.MODE_MODELSCOPE, "", "", "", "", None)
         self.assertIn("not configured", str(ctx.exception))
 
     def test_modelscope_mode_uses_visitor_token_and_quota_endpoint(self):
@@ -101,8 +97,7 @@ class ConnectionResolutionTests(unittest.TestCase):
         )
         with patch.dict(os.environ, OAUTH_ENV):
             base_url, model, api_key = app._resolve_connection(
-                app.MODE_MODELSCOPE, "  ", "", "", "pasted-key-ignored",
-                FakeRequest({msoauth.SESSION_COOKIE: "sid-test"}),
+                app.MODE_MODELSCOPE, "  ", "", "", "pasted-key-ignored", "sid-test"
             )
         self.assertEqual(base_url, msoauth.INFERENCE_BASE_URL)
         self.assertEqual(model, app.MODELSCOPE_DEFAULT_MODEL)
@@ -112,14 +107,13 @@ class ConnectionResolutionTests(unittest.TestCase):
         msoauth.SESSION_STORE.store_token(
             "sid-test", {"access_token": "visitor-token", "expires_in": 600}, {}
         )
-        request = FakeRequest({msoauth.SESSION_COOKIE: "sid-test"})
         with patch.dict(os.environ, {"RSMEM_API_KEY": ""}):
             base_url, model, api_key = app._resolve_connection(
-                app.MODE_OPENAI, "", "https://example.com/v1", "m1", "user-key", request
+                app.MODE_OPENAI, "", "https://example.com/v1", "m1", "user-key", "sid-test"
             )
             self.assertEqual((base_url, model, api_key), ("https://example.com/v1", "m1", "user-key"))
             with self.assertRaises(gr.Error):
-                app._resolve_connection(app.MODE_OPENAI, "", "", "", "", request)
+                app._resolve_connection(app.MODE_OPENAI, "", "", "", "", "sid-test")
 
     def test_switching_to_modelscope_clears_the_pasted_key(self):
         ms_pane, oa_pane, key_update = app.switch_connection_mode(app.MODE_MODELSCOPE)
@@ -137,9 +131,7 @@ class SessionStatusTests(unittest.TestCase):
 
     def test_disconnected_status_offers_sign_in_link_with_nonce(self):
         with patch.dict(os.environ, OAUTH_ENV):
-            html, signed_in = app._ms_status_html(
-                FakeRequest({msoauth.SESSION_COOKIE: "sid-status"})
-            )
+            html, signed_in = app._ms_status_html("sid-status")
         self.assertFalse(signed_in)
         self.assertIn("Sign in with ModelScope", html)
         self.assertIn("oauth/login?nonce=", html)
@@ -150,12 +142,19 @@ class SessionStatusTests(unittest.TestCase):
             {"preferred_username": "alice"},
         )
         with patch.dict(os.environ, OAUTH_ENV):
-            html, signed_in = app._ms_status_html(
-                FakeRequest({msoauth.SESSION_COOKIE: "sid-status"})
-            )
+            html, signed_in = app._ms_status_html("sid-status")
         self.assertTrue(signed_in)
         self.assertIn("alice", html)
         self.assertNotIn("secret-token", html)
+
+    def test_refresh_mints_a_browser_session_id_without_cookies(self):
+        with patch.dict(os.environ, OAUTH_ENV):
+            html, _, session_id = app.refresh_ms_session("", FakeRequest())
+        self.assertTrue(session_id)
+        self.assertIn("Sign in with ModelScope", html)
+        with patch.dict(os.environ, OAUTH_ENV):
+            html2, _, same_id = app.refresh_ms_session(session_id, FakeRequest())
+        self.assertEqual(same_id, session_id)
 
 
 class OAuthRouteTests(unittest.TestCase):

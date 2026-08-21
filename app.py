@@ -1765,13 +1765,20 @@ def _session_id_from_request(request) -> str | None:
     return cookies.get(msoauth.SESSION_COOKIE) or None
 
 
+def _effective_session_id(browser_sid: str, request) -> str | None:
+    """Prefer the BrowserState id (survives the ModelScope proxy, which
+    swallows Set-Cookie on the shell-served routes); fall back to the
+    cookie for plain local deployments."""
+    return (browser_sid or "").strip() or _session_id_from_request(request)
+
+
 def _resolve_connection(
     mode: str,
     ms_model: str,
     base_url: str,
     model: str,
     api_key: str,
-    request,
+    session_id: str | None,
 ) -> tuple[str, str, str]:
     """Map the selected connection mode to (base_url, model, api_key).
 
@@ -1786,7 +1793,7 @@ def _resolve_connection(
                 "Switch to the OpenAI-compatible API mode, or ask the Studio owner "
                 "to set OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET."
             )
-        token = msoauth.SESSION_STORE.get_token(_session_id_from_request(request))
+        token = msoauth.SESSION_STORE.get_token(session_id)
         if not token:
             raise gr.Error(
                 "Sign in with ModelScope first. RSMeM runs only with your own "
@@ -1803,7 +1810,7 @@ def _resolve_connection(
     return ((base_url or "").strip() or DEFAULT_BASE_URL, (model or "").strip() or DEFAULT_MODEL, api_key)
 
 
-def _ms_status_html(request) -> tuple[str, bool]:
+def _ms_status_html(session_id: str | None) -> tuple[str, bool]:
     """Build the ModelScope session status box. Returns (html, signed_in)."""
     if not msoauth.oauth_configured():
         return (
@@ -1813,14 +1820,12 @@ def _ms_status_html(request) -> tuple[str, bool]:
             "OpenAI-compatible API mode instead.</p></div>",
             False,
         )
-    session_id = _session_id_from_request(request)
     if not session_id:
         return (
             '<div class="auth-box"><div class="st"><span class="dot">●</span> '
-            "ModelScope session · cookies unavailable</div>"
-            "<p>Your browser blocked the session cookie. Open the Studio "
-            f'directly at <a href="{STUDIO_DIRECT_URL}" target="_blank" '
-            f'rel="noopener">{STUDIO_DIRECT_URL}</a> and sign in there.</p></div>',
+            "ModelScope session · initializing</div>"
+            "<p>Press <b>Refresh sign-in status</b> to start a browser session, "
+            "then sign in.</p></div>",
             False,
         )
     session = msoauth.SESSION_STORE.get_session(session_id)
@@ -1847,14 +1852,18 @@ def _ms_status_html(request) -> tuple[str, bool]:
     )
 
 
-def refresh_ms_session(request: gr.Request):
-    status_html, signed_in = _ms_status_html(request)
-    return status_html, gr.update(visible=signed_in)
+def refresh_ms_session(browser_sid: str, request: gr.Request):
+    session_id = _effective_session_id(browser_sid, request)
+    if not session_id:
+        session_id = secrets.token_urlsafe(24)
+    status_html, signed_in = _ms_status_html(session_id)
+    return status_html, gr.update(visible=signed_in), session_id
 
 
-def sign_out_ms(request: gr.Request):
-    msoauth.SESSION_STORE.clear(_session_id_from_request(request))
-    return refresh_ms_session(request)
+def sign_out_ms(browser_sid: str, request: gr.Request):
+    session_id = _effective_session_id(browser_sid, request)
+    msoauth.SESSION_STORE.clear(session_id)
+    return refresh_ms_session(browser_sid, request)
 
 
 def switch_connection_mode(mode: str):
@@ -1876,10 +1885,12 @@ def start_workflow_ui(
     requested_base_url: str,
     requested_model: str,
     user_api_key: str,
+    browser_sid: str,
     request: gr.Request,
 ):
     base_url, model, api_key = _resolve_connection(
-        mode, ms_model, requested_base_url, requested_model, user_api_key, request
+        mode, ms_model, requested_base_url, requested_model, user_api_key,
+        _effective_session_id(browser_sid, request),
     )
     yield from start_interactive_workflow_stream(
         query, example_name, uploaded_files, base_url, model, api_key
@@ -1893,10 +1904,12 @@ def request_custom_reflections_ui(
     requested_base_url: str,
     requested_model: str,
     user_api_key: str,
+    browser_sid: str,
     request: gr.Request,
 ):
     _, _, api_key = _resolve_connection(
-        mode, ms_model, requested_base_url, requested_model, user_api_key, request
+        mode, ms_model, requested_base_url, requested_model, user_api_key,
+        _effective_session_id(browser_sid, request),
     )
     return request_custom_reflections(state, api_key)
 
@@ -1912,10 +1925,12 @@ def confirm_reflection_and_retry_ui(
     requested_base_url: str,
     requested_model: str,
     user_api_key: str,
+    browser_sid: str,
     request: gr.Request,
 ):
     _, _, api_key = _resolve_connection(
-        mode, ms_model, requested_base_url, requested_model, user_api_key, request
+        mode, ms_model, requested_base_url, requested_model, user_api_key,
+        _effective_session_id(browser_sid, request),
     )
     return confirm_reflection_and_retry(
         state, selection, edited_reflection, user_diagnosis, user_plan, api_key
@@ -2116,6 +2131,7 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
             "</section>"
         )
         session_state = gr.State({})
+        browser_session = gr.BrowserState("", storage_key="rsmem_session")
 
         with gr.Group(elem_id="input-card"):
             gr.Markdown(
@@ -2346,10 +2362,20 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
             outputs=[ms_pane, oa_pane, api_key_input],
         )
         refresh_ms_button.click(
-            refresh_ms_session, outputs=[ms_status, signout_button]
+            refresh_ms_session,
+            inputs=[browser_session],
+            outputs=[ms_status, signout_button, browser_session],
         )
-        signout_button.click(sign_out_ms, outputs=[ms_status, signout_button])
-        demo.load(refresh_ms_session, outputs=[ms_status, signout_button])
+        signout_button.click(
+            sign_out_ms,
+            inputs=[browser_session],
+            outputs=[ms_status, signout_button, browser_session],
+        )
+        demo.load(
+            refresh_ms_session,
+            inputs=[browser_session],
+            outputs=[ms_status, signout_button, browser_session],
+        )
         run_button.click(
             start_workflow_ui,
             inputs=[
@@ -2361,6 +2387,7 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
                 base_url_input,
                 model_input,
                 api_key_input,
+                browser_session,
             ],
             outputs=workflow_outputs,
             show_progress="minimal",
@@ -2379,6 +2406,7 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
                 base_url_input,
                 model_input,
                 api_key_input,
+                browser_session,
             ],
             outputs=workflow_outputs,
         )
@@ -2410,6 +2438,7 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
                 base_url_input,
                 model_input,
                 api_key_input,
+                browser_session,
             ],
             outputs=workflow_outputs,
         )
