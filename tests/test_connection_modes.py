@@ -165,6 +165,15 @@ class OAuthRouteTests(unittest.TestCase):
 
         cls.client = TestClient(app.create_app())
 
+    def test_deployed_host_cookie_is_partitioned_for_the_iframe(self):
+        attributes = app._session_cookie_attributes("wbx929-rsmem.ms.show")
+        self.assertIn("SameSite=None", attributes)
+        self.assertIn("Secure", attributes)
+        self.assertIn("Partitioned", attributes)
+        local = app._session_cookie_attributes("127.0.0.1:7861")
+        self.assertIn("SameSite=Lax", local)
+        self.assertNotIn("Partitioned", local)
+
     def test_root_response_sets_the_session_cookie(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)

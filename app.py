@@ -2508,6 +2508,16 @@ def _request_redirect_uri(headers) -> str:
     )
 
 
+def _session_cookie_attributes(host: str | None) -> str:
+    """Local dev gets a plain Lax cookie; any deployed host gets the
+    partitioned cross-site variant so the cookie survives inside the
+    modelscope.cn iframe under third-party-cookie blocking (CHIPS)."""
+    bare = (host or "").split(",")[0].strip().lower()
+    if bare.split(":")[0] in {"127.0.0.1", "localhost", "0.0.0.0", "testserver"}:
+        return "; HttpOnly; Path=/; Max-Age=604800; SameSite=Lax"
+    return "; HttpOnly; Path=/; Max-Age=604800; SameSite=None; Secure; Partitioned"
+
+
 def create_app():
     """Wrap the Gradio app in FastAPI so the OAuth routes share the origin."""
     fastapi_app = FastAPI()
@@ -2517,15 +2527,9 @@ def create_app():
         response = await call_next(request)
         if request.url.path == "/" and not request.cookies.get(msoauth.SESSION_COOKIE):
             session_id = secrets.token_urlsafe(24)
-            proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-            if proto == "https":
-                # Partitioned keeps the cookie working inside the modelscope.cn
-                # iframe under third-party-cookie blocking (CHIPS).
-                attributes = (
-                    "; HttpOnly; Path=/; Max-Age=604800; SameSite=None; Secure; Partitioned"
-                )
-            else:
-                attributes = "; HttpOnly; Path=/; Max-Age=604800; SameSite=Lax"
+            attributes = _session_cookie_attributes(
+                request.headers.get("x-forwarded-host") or request.headers.get("host")
+            )
             response.headers.append(
                 "set-cookie", f"{msoauth.SESSION_COOKIE}={session_id}{attributes}"
             )
