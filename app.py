@@ -959,6 +959,8 @@ def run_rsmem_loop(
         raise gr.Error(f"Invalid Base URL: {exc}") from exc
 
     retrieved = retrieve_knowledge(query)
+    if retrieved and max(score for score, _ in retrieved) <= 1:
+        retrieved = []
     knowledge_lines = []
     knowledge_context_lines = []
     for index, (score, entry) in enumerate(retrieved, start=1):
@@ -1079,8 +1081,11 @@ def run_rsmem_loop(
 
 
 def _retrieve_for_session(query: str) -> tuple[str, str, list[dict]]:
+    retrieved = retrieve_knowledge(query)
+    if not retrieved or max(score for score, _ in retrieved) <= 1:
+        return "", "", []
     markdown, context, records = [], [], []
-    for index, (score, entry) in enumerate(retrieve_knowledge(query), start=1):
+    for index, (score, entry) in enumerate(retrieved, start=1):
         excerpt = re.sub(r"\s+", " ", entry["summary"]).strip()[:420]
         markdown.append(
             f"**{index}. {entry['domain']} → {entry['application']}**  \n"
@@ -1149,7 +1154,7 @@ def _execute_interactive_attempt(state: dict, api_key: str) -> dict:
     state["attempts"].append(
         {
             "attempt": attempt_number,
-            "context": {"hkg": True, "far_memory": bool(memory)},
+            "context": {"hkg": bool(state["knowledge_context"]), "far_memory": bool(memory)},
             "tool_plan": plan,
             "trajectory": trajectory,
             "executor": {
@@ -1244,7 +1249,8 @@ def _attempts_interactive_markdown(state: dict) -> str:
     for attempt in state.get("attempts", []):
         section = [
             f"### Attempt {attempt['attempt']}",
-            f"**Context:** HKG = yes · selected FAM = {'yes' if attempt['context']['far_memory'] else 'no'}",
+            f"**Context:** HKG = {'yes' if attempt['context'].get('hkg') else 'no'} · "
+            f"selected FAM = {'yes' if attempt['context']['far_memory'] else 'no'}",
             "\n#### Planned tool chain",
             "| Step | Tool | Purpose |",
             "|---:|---|---|",
@@ -1281,23 +1287,43 @@ def _interactive_timeline(state: dict) -> str:
             f'<b>Attempt {attempt["attempt"]}</b><span>{len(attempt["tool_plan"])} real tools</span>'
             f'<strong>{verdict.upper()}</strong></div>'
         )
+    has_knowledge = bool(state.get("knowledge_context", "").strip())
     stages = [
-        ("1", "HKG", "knowledge"), ("2", "Plan", "LLM tool chain"),
-        ("3", "Execute", "real CPU tools"), ("4", "Answer", "evidence synthesis"),
-        ("5", "Judge", "reference or teacher gate"), ("6", "Human", "confirm or retry"),
+        ("1", "HKG", "knowledge" if has_knowledge else "skipped: no relevant match", has_knowledge),
+        ("2", "Plan", "LLM tool chain", True),
+        ("3", "Execute", "real CPU tools", True),
+        ("4", "Answer", "evidence synthesis", True),
+        ("5", "Judge", "reference or teacher gate", True),
+        ("6", "Human", "confirm or retry", True),
     ]
     cards = "".join(
-        f'<div class="stage done"><span>{n}</span><b>{name}</b><small>{detail}</small></div>'
-        for n, name, detail in stages
+        f'<div class="stage {"done" if done else "skip"}"><span>{n}</span><b>{name}</b><small>{detail}</small></div>'
+        for n, name, detail, done in stages
     )
     return f'<div class="pipeline">{cards}</div><div class="attempts">{"".join(attempt_cards)}</div>'
 
 
-def _public_candidates(state: dict) -> dict:
-    public = {}
-    for name, candidate in state.get("candidates", {}).items():
-        public[name] = {key: value for key, value in candidate.items() if key != "evidence"}
-    return public
+REFLECTION_SELECTION_MAP = {
+    "Candidate 1": "FTRO",
+    "Candidate 2": "Full trajectory",
+    "Candidate 3": "LLM summary",
+    "Write my own": "User-authored",
+}
+
+
+def _internal_reflection_source(selection: str) -> str:
+    return REFLECTION_SELECTION_MAP.get(selection, selection)
+
+
+def _reflection_candidate_texts(state: dict) -> tuple[str, str, str]:
+    values = []
+    for source in ("FTRO", "Full trajectory", "LLM summary"):
+        candidate = state.get("candidates", {}).get(source, {})
+        if candidate.get("status") == "ok":
+            values.append(str(candidate.get("reflection", "")).strip())
+        else:
+            values.append("This candidate is unavailable for the current attempt.")
+    return tuple(values)
 
 
 def _evaluation_summary_markdown(evaluation: dict, mode: str) -> str:
@@ -1369,6 +1395,8 @@ def _render_interactive_state(state: dict):
 
     show_decision = status == "awaiting_user_decision"
     show_candidates = status == "awaiting_reflection"
+    show_knowledge = bool(state.get("knowledge_markdown", "").strip())
+    candidate_1, candidate_2, candidate_3 = _reflection_candidate_texts(state)
     final_answer = latest.get("answer", "")
     final_md = (
         f"### Current result\n\n{final_answer}\n\n"
@@ -1378,12 +1406,15 @@ def _render_interactive_state(state: dict):
         status_md,
         _interactive_timeline(state),
         state.get("knowledge_markdown", ""),
+        gr.update(visible=show_knowledge),
         _attempts_interactive_markdown(state),
         _evaluation_summary_markdown(evaluation, state.get("mode", "case")),
         decision,
         gr.update(visible=show_decision),
         gr.update(visible=show_candidates),
-        _public_candidates(state),
+        candidate_1,
+        candidate_2,
+        candidate_3,
         gr.update(value=None),
         gr.update(value=""),
         gr.update(value=""),
@@ -1425,14 +1456,15 @@ def request_custom_reflections(state: dict, user_api_key: str):
 def select_reflection_candidate(
     selection: str, state: dict, user_diagnosis: str, user_plan: str
 ) -> str:
-    if selection == "User-authored":
+    source = _internal_reflection_source(selection)
+    if source == "User-authored":
         diagnosis = user_diagnosis.strip()
         plan = user_plan.strip()
         return (
             f"Failure diagnosis: {diagnosis}\nNext-attempt plan: {plan}"
             if diagnosis or plan else ""
         )
-    candidate = (state or {}).get("candidates", {}).get(selection, {})
+    candidate = (state or {}).get("candidates", {}).get(source, {})
     return str(candidate.get("reflection", "")) if candidate.get("status") == "ok" else ""
 
 
@@ -1451,8 +1483,9 @@ def confirm_reflection_and_retry(
     api_key = user_api_key.strip() or os.getenv("RSMEM_API_KEY", "")
     if not api_key:
         raise gr.Error("API key is required for the next attempt.")
+    source = _internal_reflection_source(selection)
     reflection = edited_reflection.strip()
-    if selection == "User-authored":
+    if source == "User-authored":
         if not user_diagnosis.strip() or not user_plan.strip():
             raise gr.Error("Provide both your error diagnosis and next-attempt plan.")
         reflection = (
@@ -1461,8 +1494,8 @@ def confirm_reflection_and_retry(
         )
     if not selection or not reflection:
         raise gr.Error("Select a successful candidate and confirm a non-empty reflection.")
-    if selection != "User-authored":
-        candidate = state["candidates"].get(selection, {})
+    if source != "User-authored":
+        candidate = state["candidates"].get(source, {})
         if candidate.get("status") != "ok":
             raise gr.Error("The selected model-generated candidate is unavailable.")
 
@@ -1470,7 +1503,7 @@ def confirm_reflection_and_retry(
     updated["memory"].append(
         {
             "source_attempt": len(state["attempts"]),
-            "source": selection,
+            "source": source,
             "reflection": reflection,
         }
     )
@@ -1609,7 +1642,7 @@ For uploaded data, you decide whether to accept the result or try again.
         run_button = gr.Button("Run RSMeM", variant="primary")
         api_status = gr.Markdown("⚪ Ready. No attempt runs without a valid API key.")
         timeline_output = gr.HTML()
-        with gr.Accordion("Retrieved knowledge", open=True):
+        with gr.Accordion("Retrieved knowledge", open=True) as hkg_accordion:
             hkg_output = gr.Markdown()
         with gr.Accordion("Execution: plan, tool calls, and answer", open=True):
             attempts_output = gr.Markdown()
@@ -1630,20 +1663,28 @@ For uploaded data, you decide whether to accept the result or try again.
                 )
         with gr.Group(visible=False) as candidate_group:
             gr.Markdown(
-                "### Reflection candidates\n\nAll three model candidates use the same reflector; "
-                "only the trajectory representation changes."
+                "### Reflection candidates\n\nCompare the three suggestions below, or write your own. "
+                "The selected text remains editable before the next attempt."
             )
-            candidates_output = gr.JSON(label="Candidate comparison and provenance")
+            candidate_1_output = gr.Textbox(
+                label="Candidate 1", lines=5, interactive=False,
+            )
+            candidate_2_output = gr.Textbox(
+                label="Candidate 2", lines=5, interactive=False,
+            )
+            candidate_3_output = gr.Textbox(
+                label="Candidate 3", lines=5, interactive=False,
+            )
             candidate_choice = gr.Radio(
-                choices=["FTRO", "Full trajectory", "LLM summary", "User-authored"],
-                label="Choose one reflection source",
+                choices=["Candidate 1", "Candidate 2", "Candidate 3", "Write my own"],
+                label="Choose one option",
             )
             with gr.Row():
                 user_diagnosis = gr.Textbox(
-                    label="Your diagnosis (required for User-authored)", lines=3
+                    label="Your diagnosis (required for Write my own)", lines=3
                 )
                 user_plan = gr.Textbox(
-                    label="Your next-attempt plan (required for User-authored)", lines=3
+                    label="Your next-attempt plan (required for Write my own)", lines=3
                 )
             edited_reflection = gr.Textbox(
                 label="Final editable reflection to write into FAM", lines=6
@@ -1660,12 +1701,15 @@ For uploaded data, you decide whether to accept the result or try again.
             api_status,
             timeline_output,
             hkg_output,
+            hkg_accordion,
             attempts_output,
             evaluation_output,
             decision_output,
             decision_group,
             candidate_group,
-            candidates_output,
+            candidate_1_output,
+            candidate_2_output,
+            candidate_3_output,
             candidate_choice,
             user_diagnosis,
             user_plan,

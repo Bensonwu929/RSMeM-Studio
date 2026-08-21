@@ -151,7 +151,8 @@ class InteractiveWorkflowTests(unittest.TestCase):
             "max_attempts": 10,
             "model": "test-model",
             "data_source": "visitor-uploaded GeoTIFFs",
-            "knowledge_markdown": "knowledge",
+            "knowledge_markdown": "",
+            "knowledge_context": "",
             "candidates": {},
             "artifacts": [],
             "attempts": [{
@@ -166,9 +167,50 @@ class InteractiveWorkflowTests(unittest.TestCase):
             }],
         }
         rendered = app._render_interactive_state(state)
-        self.assertTrue(rendered[6]["visible"])
-        self.assertFalse(rendered[7]["visible"])
-        self.assertIn("your decision is final", rendered[5])
+        self.assertFalse(rendered[3]["visible"])
+        self.assertTrue(rendered[7]["visible"])
+        self.assertFalse(rendered[8]["visible"])
+        self.assertIn("your decision is final", rendered[6])
+        self.assertIn("skipped: no relevant match", rendered[1])
+
+    def test_all_low_score_knowledge_is_removed_from_ui_and_context(self):
+        entry = {
+            "domain": "Environmental Monitoring",
+            "application": "Atmospheric Parameter Estimation",
+            "summary": "Low-relevance guidance.",
+        }
+        with patch.object(app, "retrieve_knowledge", return_value=[(1, entry), (1, entry)]):
+            markdown, context, records = app._retrieve_for_session("unrelated task")
+        self.assertEqual(markdown, "")
+        self.assertEqual(context, "")
+        self.assertEqual(records, [])
+
+    def test_relevant_knowledge_is_kept_when_top_score_exceeds_one(self):
+        entry = {
+            "domain": "Disaster Management",
+            "application": "Drought Monitoring",
+            "summary": "Use TVDI for drought analysis.",
+        }
+        with patch.object(app, "retrieve_knowledge", return_value=[(4, entry)]):
+            markdown, context, records = app._retrieve_for_session("calculate TVDI")
+        self.assertIn("Drought Monitoring", markdown)
+        self.assertIn("Use TVDI", context)
+        self.assertEqual(records[0]["score"], 4)
+
+    def test_candidate_ui_hides_internal_provenance_names(self):
+        state = {"candidates": {
+            "FTRO": {"status": "ok", "reflection": "First repair."},
+            "Full trajectory": {"status": "ok", "reflection": "Second repair."},
+            "LLM summary": {"status": "ok", "reflection": "Third repair."},
+        }}
+        self.assertEqual(
+            app._reflection_candidate_texts(state),
+            ("First repair.", "Second repair.", "Third repair."),
+        )
+        self.assertEqual(
+            app.select_reflection_candidate("Candidate 1", state, "", ""),
+            "First repair.",
+        )
 
     def test_correct_case_stops_after_one_attempt_without_reflector(self):
         api = StudioApi(["correct"])
