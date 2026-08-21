@@ -179,6 +179,12 @@ class OAuthRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(msoauth.SESSION_COOKIE, response.cookies)
 
+    def test_config_response_sets_the_session_cookie_for_the_platform_shell(self):
+        self.client.cookies.clear()
+        response = self.client.get("/config")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(msoauth.SESSION_COOKIE, response.cookies)
+
     def test_login_without_configuration_returns_503(self):
         with patch.dict(os.environ, {"OAUTH_CLIENT_ID": "", "OAUTH_CLIENT_SECRET": ""}):
             response = self.client.get("/oauth/login", params={"nonce": "x"})

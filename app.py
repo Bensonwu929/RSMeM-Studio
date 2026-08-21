@@ -2525,7 +2525,13 @@ def create_app():
     @fastapi_app.middleware("http")
     async def ensure_session_cookie(request: Request, call_next):
         response = await call_next(request)
-        if request.url.path == "/" and not request.cookies.get(msoauth.SESSION_COOKIE):
+        # On modelscope.cn the "/" document is the platform shell and never
+        # reaches this app; "/config" is the first same-origin request the
+        # shell makes, so the cookie is set there (and only there, to avoid
+        # racing session ids across parallel requests).
+        if request.url.path in ("/", "/config") and not request.cookies.get(
+            msoauth.SESSION_COOKIE
+        ):
             session_id = secrets.token_urlsafe(24)
             attributes = _session_cookie_attributes(
                 request.headers.get("x-forwarded-host") or request.headers.get("host")
