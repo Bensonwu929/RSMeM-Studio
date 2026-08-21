@@ -128,10 +128,11 @@ The hosted artifact is organized into six auditable layers:
   configuration, execution trace, and artifact download.
 - **Knowledge retriever:** lightweight retrieval over the released hierarchical
   geoscience knowledge base.
-- **Planner:** required LLM-based tool planning constrained to the published CPU
-  tool registry; malformed, empty, or unsupported plans are reported as errors.
-- **CPU tool runtime:** Rasterio and NumPy implementations of selected public
-  RSMeM Index, Statistics, Inversion, and Analysis semantics.
+- **Planner:** required LLM-based tool planning constrained to tools discovered
+  live from the CPU MCP servers; malformed, empty, or unavailable plans fail.
+- **CPU MCP runtime:** four independent stdio services—Analysis, Index,
+  Inversion, and Statistics—plus rasterio-only case adapters registered inside
+  those processes. Execution uses MCP `call_tool`, not in-process tool calls.
 - **Judge/Gate and FAR memory:** isolated case judging, an advisory no-answer
   upload gate, three trajectory representations through one reflector, and
   explicit user confirmation before memory injection.
@@ -139,9 +140,9 @@ The hosted artifact is organized into six auditable layers:
   loopback Base URLs, request-scoped uploads, isolated temporary outputs, and no
   embedded API credentials.
 
-GPU-based visual perception services are intentionally excluded from the free
-CPU deployment. The complete open-source repository retains the original MCP
-tool interfaces and deployment documentation for extending the Studio.
+GPU-based Perception is intentionally excluded from the free CPU deployment.
+Its MCP position and deployment documentation remain in the repository for a
+future GPU-backed version.
 
 ## 6. Demonstration results
 

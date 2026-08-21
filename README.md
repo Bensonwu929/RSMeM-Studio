@@ -41,8 +41,9 @@ core memory workflow. It retrieves structured domain knowledge, plans and runs
 real raster operations, synthesizes an evidence-grounded answer, applies either a
 reference-aware case judge or a ground-truth-free Teacher Failure Gate, and lets
 the user choose which reflection enters memory.
-The full experimental framework and MCP tool stack remain available in the
-public source repository.
+The Studio starts the released Analysis, Index, Inversion, and Statistics
+servers as four independent stdio MCP processes. The full experimental
+framework and GPU Perception stack remain available in the public repository.
 
 ## Observable RSMeM loop
 
@@ -51,8 +52,9 @@ framework:
 
 1. Retrieve query-relevant hierarchical knowledge (HKG).
 2. Plan a short remote-sensing tool chain.
-3. Execute a constrained Index/Statistics tool subset over real GeoTIFF data and
-   record tool calls, parameters, observations, and downloadable artifacts.
+3. Discover the live CPU tool catalog with MCP `list_tools`, execute selected
+   operations with MCP `call_tool`, and record parameters, observations, and
+   downloadable artifacts.
 4. Synthesize a final answer using only real tool evidence.
 5. Evaluate bundled cases with a reference-aware LLM judge; evaluate uploads
    with a ground-truth-free Teacher Failure Gate whose advice the user may
@@ -93,9 +95,9 @@ can run one of thirteen bundled demonstrations:
 12. Thailand: MaxFRP composite → fire-prone upper-quartile mask.
 13. Shanghai: total minus non-residential volume → 1985–2020 trend.
 
-The CPU runtime mirrors selected public RSMeM
-Index/Statistics tool contracts using Rasterio and NumPy. GPU perception tools
-are intentionally disabled on the free CPU instance.
+The CPU runtime exposes the four released EarthAgent/RSMeM MCP services plus
+rasterio-only case adapters: **Analysis, Index, Inversion, and Statistics**.
+GPU-backed **Perception** is explicitly disabled on the free CPU instance.
 
 ## Data attribution
 
@@ -127,7 +129,7 @@ explicit error; the Studio never replaces model planning with a preset fallback.
 ## Resources
 
 - Source: https://github.com/AI9Stars/RSMeM
-- ModelScope Learn: paste the public article URL here after publication
+- ModelScope Learn: https://modelscope.cn/learn/435887
 - License: MIT
 
 ## Local launch
@@ -140,5 +142,5 @@ python app.py
 ## Scope
 
 The Studio is an executable artifact for the Open Source GeoAI Practice
-Challenge. It runs a safe CPU subset of the released tool stack, but does not
-claim to run the GPU perception services or the complete EarthBench evaluation.
+Challenge. It runs four CPU MCP services, but does not claim to run the GPU
+Perception service or the complete EarthBench evaluation.
