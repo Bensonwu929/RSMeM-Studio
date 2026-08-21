@@ -175,6 +175,7 @@ class OAuthRouteTests(unittest.TestCase):
         self.assertNotIn("Partitioned", local)
 
     def test_root_response_sets_the_session_cookie(self):
+        self.client.cookies.clear()
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertIn(msoauth.SESSION_COOKIE, response.cookies)
