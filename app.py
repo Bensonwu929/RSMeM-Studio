@@ -19,7 +19,7 @@ import rasterio
 from openai import OpenAI
 from rasterio.enums import Resampling
 
-from cpu_tools import (
+from mcp_runtime import (
     apparent_thermal_inertia,
     calc_batch_image_mean,
     calculate_area,
@@ -35,7 +35,6 @@ from cpu_tools import (
     create_threshold_mask,
     fire_prone_mask,
     hotspot_direction,
-    infer_band_roles,
     inspect_rasters,
     linear_trend,
     lst_single_channel,
@@ -44,7 +43,15 @@ from cpu_tools import (
     raster_skewness,
     sens_slope,
     subtract_rasters,
+    difference as mcp_difference,
+    max_three_day_window as mcp_max_three_day_window,
+    max_value_and_index as mcp_max_value_and_index,
+    validate_inputs as mcp_validate_inputs,
+    validate_result as mcp_validate_result,
+    discover_workflow_tools,
+    workflow_mcp,
 )
+from cpu_tools import infer_band_roles
 from workflow_logic import (
     generate_reflection_candidates,
     judge_builtin_case,
@@ -363,12 +370,16 @@ def extract_json_object(text: str) -> dict | list | None:
     return None
 
 
-def normalize_plan(data: dict | list | None) -> list[dict]:
+def normalize_plan(
+    data: dict | list | None,
+    supported_tools: set[str] | frozenset[str] | None = None,
+) -> list[dict]:
     if isinstance(data, dict):
         data = data.get("tool_chain") or data.get("tools") or data.get("plan")
     if not isinstance(data, list):
         raise ValueError("The planner did not return a JSON tool_chain array.")
 
+    supported_tools = SUPPORTED_TOOLS if supported_tools is None else supported_tools
     normalized = []
     for item in data[:5]:
         if isinstance(item, str):
@@ -384,7 +395,7 @@ def normalize_plan(data: dict | list | None) -> list[dict]:
         else:
             raise ValueError("Every tool-chain item must name a supported tool.")
 
-        if tool not in SUPPORTED_TOOLS:
+        if tool not in supported_tools:
             raise ValueError(f"The planner selected an unsupported tool: {tool}")
         normalized.append({"tool": tool, "purpose": purpose, "parameters": parameters})
 
@@ -403,6 +414,14 @@ def plan_toolchain(
 ) -> list[dict]:
     if not api_key:
         raise ValueError("An API key is required for RSMeM planning.")
+    live_tools = discover_workflow_tools()
+    missing = SUPPORTED_TOOLS - set(live_tools)
+    if missing:
+        raise ValueError(f"Required MCP tools were not discovered: {', '.join(sorted(missing))}")
+    live_reference = "\n".join(
+        line for line in TOOL_REFERENCE.splitlines()
+        if line.removeprefix("- ").split(":", 1)[0] in live_tools
+    )
     system = """You are the planner inside RSMeM. Select a short remote-sensing tool chain.
 Return ONLY JSON with a tool_chain array. Each item must contain tool, purpose, and parameters.
 Use only tools in the supplied reference. Always inspect inputs before band-dependent tools.
@@ -416,10 +435,10 @@ Failure-aware memory from the previous attempt:
 {reflection[:2000] or "(none; this is the first attempt)"}
 
 Available executable CPU tool reference:
-{TOOL_REFERENCE}
+{live_reference}
 """
     raw = api_completion(api_key, base_url, model, system, user, max_tokens=700)
-    return normalize_plan(extract_json_object(raw))
+    return normalize_plan(extract_json_object(raw), live_tools)
 
 
 def _normalize_preview_band(array: np.ndarray) -> np.ndarray:
@@ -507,7 +526,7 @@ def prepare_rasters(uploaded_files, run_dir: Path, example_name: str) -> tuple[l
     raise gr.Error("Custom GeoTIFF mode requires at least one uploaded .tif or .tiff file.")
 
 
-def execute_cpu_tools(
+def _execute_cpu_tools_over_mcp(
     plan: list[dict],
     raster_paths: list[str],
     run_dir: Path,
@@ -538,9 +557,8 @@ def execute_cpu_tools(
                 )
                 parameters = {"files": [Path(path).name for path in raster_paths[:8]], "total": len(raster_paths)}
             elif tool == "validate_inputs":
-                if len(raster_paths) < 1:
-                    raise ValueError("No raster inputs are available.")
-                observation = f"Validated {len(raster_paths)} readable GeoTIFF inputs and isolated output paths."
+                result = mcp_validate_inputs(raster_paths)
+                observation = f"Validated {result['count']} readable GeoTIFF inputs and isolated output paths."
             elif tool == "lst_single_channel":
                 bt = next((p for p in raster_paths if "bt10" in Path(p).name.lower()), None)
                 red = next((p for p in raster_paths if re.search(r"(^|[_-])b4([_.-]|$)", Path(p).name.lower())), None)
@@ -757,25 +775,21 @@ def execute_cpu_tools(
                 observation = json.dumps(dict(zip(last_labels, changes)), ensure_ascii=False)
                 parameters = {"formula": "(current - previous) / previous × 100"}
             elif tool == "max_value_and_index":
-                finite = [(index, value) for index, value in enumerate(last_values) if np.isfinite(value)]
-                if not finite:
-                    raise ValueError("No finite values are available for maximum selection.")
-                max_index, max_value = max(finite, key=lambda row: row[1])
+                maximum = mcp_max_value_and_index(last_values)
+                max_index, max_value = int(maximum["index"]), float(maximum["maximum"])
                 observation = json.dumps(
                     {"maximum": max_value, "interval": last_labels[max_index] if last_labels else max_index},
                     ensure_ascii=False,
                 )
                 parameters = {"values": len(last_values)}
             elif tool == "max_three_day_window":
-                if len(last_values) < 3:
-                    raise ValueError("At least three daily values are required.")
-                windows = [float(np.mean(last_values[i:i + 3])) for i in range(len(last_values) - 2)]
-                best = int(np.nanargmax(windows))
+                window = mcp_max_three_day_window(last_values)
+                best = int(window["start_index"])
                 observation = json.dumps(
                     {
                         "start": last_labels[best],
                         "end": last_labels[best + 2],
-                        "three_day_mean": windows[best],
+                        "three_day_mean": window["three_day_mean"],
                     },
                     ensure_ascii=False,
                 )
@@ -799,17 +813,12 @@ def execute_cpu_tools(
             elif tool == "difference":
                 if len(last_values) < 2:
                     raise ValueError("Difference requires at least two preceding regional statistics.")
-                change = abs(last_values[1] - last_values[0])
-                direction = "second period is higher" if last_values[1] > last_values[0] else "first period is higher"
-                observation = json.dumps(
-                    {"first": last_values[0], "second": last_values[1], "absolute_difference": change, "direction": direction},
-                    ensure_ascii=False,
-                )
+                comparison = mcp_difference(last_values[0], last_values[1])
+                observation = json.dumps(comparison, ensure_ascii=False)
                 parameters = {"a": last_values[0], "b": last_values[1]}
             elif tool == "validate_result":
-                if not artifacts and len(raster_paths) == 0:
-                    raise ValueError("No input or derived artifact can be validated.")
-                observation = "All produced artifacts exist, are readable, and contain finite raster values."
+                validation = mcp_validate_result(raster_paths, artifacts)
+                observation = f"Validated {validation['checked']} readable input/result raster(s)."
             else:
                 raise ValueError(f"Unsupported CPU tool: {tool}")
         except Exception as exc:
@@ -840,6 +849,17 @@ def execute_cpu_tools(
         f"The real CPU tool chain completed and produced {len(artifacts)} downloadable artifact(s).",
         artifacts,
     )
+
+
+def execute_cpu_tools(
+    plan: list[dict],
+    raster_paths: list[str],
+    run_dir: Path,
+    attempt: int,
+) -> tuple[list[dict], bool, list[str], str, list[str]]:
+    """Run the full CPU chain through four discovered stdio MCP servers."""
+    with workflow_mcp(run_dir):
+        return _execute_cpu_tools_over_mcp(plan, raster_paths, run_dir, attempt)
 
 
 _GEOTRACE_ERROR_KEYWORDS = (
@@ -2157,10 +2177,10 @@ For uploaded data, you decide whether to accept the result or try again.
 - Knowledge base included in this Studio: 3 domains, 12 subdomains, and 64 atomic tasks
 - Code license: MIT · bundled example-data license: Apache-2.0
 
-The full repository contains experiment configurations, the evaluation pipeline,
-the original MCP servers, and deployment instructions for GPU perception services.
-This Studio connects the CPU-safe Index/Statistics subset directly so uploaded
-GeoTIFFs generate auditable and downloadable outputs without a GPU.
+The Studio starts four released CPU services—Analysis, Index, Inversion, and
+Statistics—as independent stdio MCP processes. The planner is constrained by
+their live `list_tools` responses and execution uses MCP `call_tool`. GPU-backed
+Perception remains explicitly disabled on this free CPU deployment.
 
 ### Cite the paper
 
