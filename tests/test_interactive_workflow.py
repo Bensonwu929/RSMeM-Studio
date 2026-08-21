@@ -172,6 +172,41 @@ class InteractiveWorkflowTests(unittest.TestCase):
         self.assertFalse(rendered[8]["visible"])
         self.assertIn("your decision is final", rendered[6])
         self.assertIn("skipped: no relevant match", rendered[1])
+        self.assertIn('class="stage current"><span>6</span><b>Human</b>', rendered[1])
+        self.assertIn("### Task", rendered[16])
+        self.assertIn("Supported answer.", rendered[16])
+
+    def test_reflection_stage_is_current_only_while_reflection_is_pending(self):
+        state = {
+            "status": "awaiting_reflection",
+            "mode": "case",
+            "knowledge_context": "relevant guidance",
+            "memory": [],
+            "attempts": [{
+                "attempt": 1,
+                "tool_plan": [{"tool": "inspect_rasters"}],
+                "evaluation": {"verdict": "incorrect"},
+            }],
+        }
+        rendered = app._interactive_timeline(state)
+        self.assertIn('class="stage current"><span>7</span><b>Reflect</b>', rendered)
+        self.assertIn('class="stage skip"><span>6</span><b>Human</b>', rendered)
+
+    def test_successful_builtin_case_marks_reflection_as_skipped(self):
+        state = {
+            "status": "completed_case_correct",
+            "mode": "case",
+            "knowledge_context": "relevant guidance",
+            "memory": [],
+            "attempts": [{
+                "attempt": 1,
+                "tool_plan": [{"tool": "inspect_rasters"}],
+                "evaluation": {"verdict": "correct"},
+            }],
+        }
+        rendered = app._interactive_timeline(state)
+        self.assertIn('class="stage skip"><span>7</span><b>Reflect</b>', rendered)
+        self.assertIn("CORRECT", rendered)
 
     def test_all_low_score_knowledge_is_removed_from_ui_and_context(self):
         entry = {

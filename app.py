@@ -1278,29 +1278,70 @@ def _attempts_interactive_markdown(state: dict) -> str:
 
 
 def _interactive_timeline(state: dict) -> str:
+    """Render a compact, state-aware RSMeM progress strip."""
     attempt_cards = []
     for attempt in state.get("attempts", []):
         verdict = str(attempt["evaluation"].get("verdict", "unknown"))
         passed = verdict in {"correct", "pass_supported", "pass_recovered"}
+        verdict_label = {
+            "correct": "CORRECT",
+            "incorrect": "RETRY",
+            "pass_supported": "SUPPORTED",
+            "pass_recovered": "RECOVERED",
+            "retry_unsupported": "REVIEW",
+            "retry_inconsistent": "REVIEW",
+            "uncertain": "UNCERTAIN",
+        }.get(verdict, verdict.upper())
         attempt_cards.append(
             f'<div class="attempt {"pass" if passed else "fail"}">'
-            f'<b>Attempt {attempt["attempt"]}</b><span>{len(attempt["tool_plan"])} real tools</span>'
-            f'<strong>{verdict.upper()}</strong></div>'
+            f'<b>Attempt {attempt["attempt"]}</b>'
+            f'<span>{len(attempt["tool_plan"])} tools</span>'
+            f'<strong>{verdict_label}</strong></div>'
         )
+    status = state.get("status", "not_started")
+    has_attempt = bool(state.get("attempts"))
     has_knowledge = bool(state.get("knowledge_context", "").strip())
+    has_memory = bool(state.get("memory"))
+    custom_mode = state.get("mode") == "custom"
+
+    def stage_state(name: str) -> str:
+        if name == "retrieve":
+            return "done" if has_knowledge else "skip"
+        if name in {"plan", "execute", "answer", "evaluate"}:
+            return "done" if has_attempt else "pending"
+        if name == "human":
+            if status == "awaiting_user_decision":
+                return "current"
+            if status == "completed_user_accepted":
+                return "done"
+            return "skip" if not custom_mode else "pending"
+        if name == "reflect":
+            if status == "awaiting_reflection":
+                return "current"
+            if has_memory:
+                return "done"
+            if status in {"completed_case_correct", "completed_user_accepted", "max_attempts_reached"}:
+                return "skip"
+            return "pending"
+        return "pending"
+
     stages = [
-        ("1", "HKG", "knowledge" if has_knowledge else "skipped: no relevant match", has_knowledge),
-        ("2", "Plan", "LLM tool chain", True),
-        ("3", "Execute", "real CPU tools", True),
-        ("4", "Answer", "evidence synthesis", True),
-        ("5", "Judge", "reference or teacher gate", True),
-        ("6", "Human", "confirm or retry", True),
+        ("1", "Retrieve", "relevant knowledge" if has_knowledge else "skipped: no relevant match", "retrieve"),
+        ("2", "Plan", "LLM tool chain", "plan"),
+        ("3", "Execute", "real CPU tools", "execute"),
+        ("4", "Answer", "evidence synthesis", "answer"),
+        ("5", "Evaluate", "case judge or teacher gate", "evaluate"),
+        ("6", "Human", "accept or request retry", "human"),
+        ("7", "Reflect", "repair and evolve memory", "reflect"),
     ]
     cards = "".join(
-        f'<div class="stage {"done" if done else "skip"}"><span>{n}</span><b>{name}</b><small>{detail}</small></div>'
-        for n, name, detail, done in stages
+        f'<div class="stage {stage_state(key)}"><span>{n}</span><b>{name}</b><small>{detail}</small></div>'
+        for n, name, detail, key in stages
     )
-    return f'<div class="pipeline">{cards}</div><div class="attempts">{"".join(attempt_cards)}</div>'
+    return (
+        f'<div class="pipeline" aria-label="RSMeM execution stages">{cards}</div>'
+        f'<div class="attempts">{"".join(attempt_cards)}</div>'
+    )
 
 
 REFLECTION_SELECTION_MAP = {
@@ -1399,6 +1440,7 @@ def _render_interactive_state(state: dict):
     candidate_1, candidate_2, candidate_3 = _reflection_candidate_texts(state)
     final_answer = latest.get("answer", "")
     final_md = (
+        f"### Task\n\n{state.get('query', '')}\n\n"
         f"### Current result\n\n{final_answer}\n\n"
         f"**Data source:** {state.get('data_source', '')}"
     )
@@ -1421,6 +1463,7 @@ def _render_interactive_state(state: dict):
         gr.update(value=""),
         final_md,
         state.get("artifacts", []),
+        gr.update(visible=bool(state.get("attempts"))),
     )
 
 
@@ -1516,32 +1559,107 @@ def confirm_reflection_and_retry(
 
 
 CSS = """
-.hero {text-align:center; padding: 1rem 0 0.4rem 0;}
-.hero h1 {margin-bottom: .35rem;}
-.note {border-left: 4px solid #2f6fed; padding: .75rem 1rem; background: #f5f8ff;}
-.pipeline {display:flex; gap:8px; align-items:stretch; flex-wrap:wrap; margin:12px 0 18px;}
-.stage {flex:1 1 135px; min-width:125px; border-radius:12px; padding:12px; border:1px solid #dfe4ef; background:#f7f8fc;}
-.stage span {display:inline-flex; width:24px; height:24px; border-radius:50%; align-items:center; justify-content:center; margin-right:7px; background:#e2e7f8;}
-.stage b {display:inline-block;}
-.stage small {display:block; margin-top:7px; color:#5f6678;}
-.stage.done {border-color:#8db7ff; background:#eef5ff;}
-.stage.done span {background:#306ee8; color:white;}
-.stage.skip {opacity:.58;}
-.attempts {display:flex; gap:12px; flex-wrap:wrap; margin-bottom:12px;}
-.attempt {display:flex; gap:16px; align-items:center; padding:10px 14px; border-radius:10px; border:1px solid #dfe4ef;}
-.attempt span {color:#60697b;}
-.attempt.pass {background:#effaf3; border-color:#78cc96;}
-.attempt.pass strong {color:#168243;}
-.attempt.fail {background:#fff3f1; border-color:#ef9b8e;}
-.attempt.fail strong {color:#c13b2a;}
-#custom-upload-accordion {border:1px solid #7b82f6 !important; background:#f7f7ff !important;}
+/* Codex-inspired neutral system: color communicates state, never decoration. */
+.gradio-container {
+  --background-fill-primary: #f7f7f7;
+  --background-fill-secondary: #ffffff;
+  --block-background-fill: #ffffff;
+  --block-border-color: #e3e3e3;
+  --block-label-background-fill: transparent;
+  --block-title-text-color: #242424;
+  --body-text-color: #242424;
+  --body-text-color-subdued: #737373;
+  --input-background-fill: #ffffff;
+  --input-border-color: #dddddd;
+  --button-primary-background-fill: #202020;
+  --button-primary-background-fill-hover: #333333;
+  --button-primary-text-color: #ffffff;
+  --color-accent: #202020;
+  background:#f7f7f7 !important;
+  color:#242424 !important;
+  max-width:none !important;
+  padding:0 !important;
+}
+.gradio-container > .main {max-width:1600px !important; margin:0 auto !important; padding:0 22px 28px !important;}
+.gradio-container .block label span {background:#eeeeee !important; color:#242424 !important;}
+#run-setup .container > span {background:#eeeeee !important; color:#242424 !important;}
+.gradio-container a {color:#444444 !important;}
+.hero {display:flex; align-items:center; justify-content:center; gap:10px; padding:22px 0 12px;}
+.hero h1 {font-size:25px !important; line-height:1.2 !important; margin:0 !important; letter-spacing:-.02em;}
+.hero p {margin:0 !important; color:#737373; font-size:13px;}
+.note {border-left:3px solid #262626; padding:.75rem 1rem; background:#f1f1f1;}
+
+/* Progress strip */
+#workflow-status {margin-top:12px;}
+#workflow-status .prose {font-size:13px !important; color:#626262;}
+#workflow-status h3 {font-size:14px !important; margin:0 0 4px !important; color:#242424;}
+#workflow-timeline {border:0 !important; background:transparent !important; padding:0 !important;}
+.pipeline {display:grid; grid-template-columns:repeat(7,minmax(112px,1fr)); gap:7px; margin:10px 0 11px;}
+.stage {min-width:0; border-radius:11px; padding:10px; border:1px solid #e2e2e2; background:#ffffff; color:#262626;}
+.stage span {display:inline-flex; width:22px; height:22px; border-radius:50%; align-items:center; justify-content:center; margin-right:6px; background:#ededed; color:#555555; font-size:11px;}
+.stage b {display:inline-block; font-size:12px;}
+.stage small {display:block; margin-top:6px; color:#777777; font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.stage.done {border-color:#d5d5d5; background:#fafafa;}
+.stage.done span {background:#252525; color:#ffffff;}
+.stage.current {border-color:#999999; background:#eeeeee; box-shadow:0 0 0 3px rgba(0,0,0,.05);}
+.stage.current span {background:#252525; color:#ffffff;}
+.stage.pending {opacity:.62;}
+.stage.skip {opacity:.42;}
+.attempts {display:flex; gap:8px; flex-wrap:wrap; margin:0 0 12px;}
+.attempt {display:flex; gap:10px; align-items:center; padding:6px 10px; border-radius:999px; border:1px solid #dddddd; background:#ffffff; font-size:11px;}
+.attempt span {color:#737373;}
+.attempt strong {font-size:10px; letter-spacing:.04em;}
+.attempt.pass strong {color:#18794e;}
+.attempt.fail strong {color:#b54735;}
+
+/* Setup and workspace */
+#run-setup {background:#ffffff; border:1px solid #e3e3e3; border-radius:16px; padding:16px !important; margin-top:8px; box-shadow:0 8px 24px rgba(0,0,0,.025);}
+#run-setup h3 {font-size:14px !important; margin-top:0 !important;}
+#custom-upload-accordion {border:1px solid #cfcfcf !important; background:#fafafa !important; border-radius:11px !important;}
 #custom-upload-accordion button,
-#custom-upload-accordion .label-wrap {font-weight:800 !important; color:#3038a8 !important;}
-#decision-panel {border:2px solid #6d72f2 !important; border-radius:14px !important; padding:16px !important; background:#f6f7ff !important;}
-#decision-panel h3 {margin-top:0 !important; color:#3038a8 !important;}
-#accept-result-button button, #accept-result-button {font-weight:800 !important;}
-#retry-result-button button, #retry-result-button {font-weight:800 !important;}
-footer {visibility: hidden;}
+#custom-upload-accordion .label-wrap {font-weight:700 !important; color:#252525 !important;}
+#run-rsmem-button {margin-top:4px;}
+#run-rsmem-button button, #run-rsmem-button {font-weight:750 !important; min-height:44px !important;}
+#rsmem-workspace {align-items:stretch !important; gap:12px !important; margin-top:8px;}
+.workspace-panel {background:#ffffff !important; border:1px solid #e3e3e3 !important; border-radius:16px !important; padding:0 !important; overflow:hidden !important; box-shadow:0 8px 24px rgba(0,0,0,.025); min-width:0 !important;}
+.workspace-heading {padding:13px 14px 10px !important; margin:0 !important; border-bottom:1px solid #eeeeee;}
+.workspace-heading h3 {font-size:14px !important; margin:0 0 3px !important;}
+.workspace-heading p {font-size:11px !important; color:#777777 !important; margin:0 !important;}
+.workspace-content {padding:12px 14px !important;}
+.workspace-panel .label-wrap {font-size:12px !important;}
+.workspace-panel table {font-size:11px !important;}
+.workspace-panel .prose {font-size:12px !important; line-height:1.55 !important;}
+#task-result-panel {flex:0.9 1 0 !important;}
+#execution-panel {flex:1.2 1 0 !important;}
+#evidence-panel {flex:0.9 1 0 !important;}
+#current-result {border-left:3px solid #262626 !important; background:#f3f3f3 !important; border-radius:0 10px 10px 0 !important; padding:10px 12px !important;}
+#current-result h3 {font-size:13px !important; margin-top:0 !important;}
+#decision-panel {border-top:1px solid #e5e5e5 !important; margin-top:12px !important; padding-top:12px !important; background:transparent !important;}
+#decision-panel h3 {margin-top:0 !important; color:#242424 !important; font-size:14px !important;}
+#accept-result-button button, #accept-result-button {font-weight:800 !important; background:#202020 !important; color:#ffffff !important;}
+#retry-result-button button, #retry-result-button {font-weight:800 !important; background:#ffffff !important; color:#a53b2a !important; border:1px solid #ddb4ab !important;}
+#evaluation-card {background:#fafafa !important; border:1px solid #e6e6e6 !important; border-radius:11px !important; padding:10px 12px !important;}
+#evaluation-card h3 {font-size:13px !important; margin-top:0 !important;}
+#reflection-panel {background:#ffffff !important; border:1px solid #d7d7d7 !important; border-radius:16px !important; padding:16px !important; margin-top:12px;}
+#reflection-panel h3 {font-size:15px !important; margin-top:0 !important;}
+.workspace-panel .gradio-accordion {border-color:#e5e5e5 !important; border-radius:10px !important; background:#ffffff !important;}
+.workspace-panel .gradio-accordion > button {font-weight:700 !important;}
+footer {visibility:hidden; height:0;}
+
+@media (max-width:1100px) {
+  .pipeline {grid-template-columns:repeat(4,minmax(110px,1fr));}
+  #rsmem-workspace {flex-wrap:wrap !important;}
+  #task-result-panel, #execution-panel {flex:1 1 46% !important;}
+  #evidence-panel {flex:1 1 100% !important;}
+}
+@media (max-width:720px) {
+  .gradio-container > .main {padding:0 10px 18px !important;}
+  .hero {display:block; text-align:center;}
+  .hero p {margin-top:5px !important;}
+  .pipeline {grid-template-columns:repeat(2,minmax(0,1fr));}
+  #rsmem-workspace {display:block !important;}
+  .workspace-panel {margin-bottom:10px !important;}
+}
 """
 
 
@@ -1583,85 +1701,128 @@ For uploaded data, you decide whether to accept the result or try again.
             """
         )
         session_state = gr.State({})
-        example_input = gr.Dropdown(
-            label="Case example",
-            choices=list(EXAMPLES),
-            value=DEFAULT_EXAMPLE,
-        )
-        dataset_info = gr.Markdown(
-            f"**Included data and workflow:** {EXAMPLES[DEFAULT_EXAMPLE]['description']}"
-        )
-        query_input = gr.Textbox(
-            label="Task for the agent",
-            value=EXAMPLES[DEFAULT_EXAMPLE]["query"],
-            lines=3,
-            info="You may edit the bundled task before running it.",
-        )
-        example_input.change(
-            load_example,
-            inputs=[example_input],
-            outputs=[query_input, dataset_info],
-        )
-        with gr.Accordion(
-            "📤 Use your own GeoTIFF files (optional)",
-            open=False,
-            elem_id="custom-upload-accordion",
-        ):
-            raster_input = gr.File(
-                label="GeoTIFF files",
-                file_count="multiple",
-                file_types=[".tif", ".tiff"],
-                type="filepath",
+        with gr.Group(elem_id="run-setup"):
+            example_input = gr.Dropdown(
+                label="Case example",
+                choices=list(EXAMPLES),
+                value=DEFAULT_EXAMPLE,
             )
-            gr.Markdown(
-                "**Accepted here:** `.tif` and `.tiff` GeoTIFF files. Uploaded files replace "
-                "the bundled case data for this run. Single-band files are safest; recognizable "
-                "band and date names improve automatic pairing. JPG, PNG, NetCDF, and HDF are not "
-                "processed by this CPU deployment."
+            dataset_info = gr.Markdown(
+                f"**Included data and workflow:** {EXAMPLES[DEFAULT_EXAMPLE]['description']}"
             )
-        gr.Markdown("### Model connection")
-        with gr.Row():
-            base_url_input = gr.Textbox(
-                label="OpenAI-compatible Base URL",
-                value=DEFAULT_BASE_URL,
-                placeholder="https://provider.example/v1",
-                info="Only public HTTPS endpoints are accepted.",
+            query_input = gr.Textbox(
+                label="Task for the agent",
+                value=EXAMPLES[DEFAULT_EXAMPLE]["query"],
+                lines=3,
+                info="You may edit the bundled task before running it.",
             )
-            model_input = gr.Textbox(
-                label="Model",
-                value=DEFAULT_MODEL,
-                placeholder="Provider model identifier",
-                info="Use the exact model identifier exposed by your provider.",
+            example_input.change(
+                load_example,
+                inputs=[example_input],
+                outputs=[query_input, dataset_info],
             )
-        api_key_input = gr.Textbox(
-            label="API key",
-            type="password",
-            placeholder="Enter your key for this request",
-            info="Used for this run only and never saved by the Studio.",
-        )
-        run_button = gr.Button("Run RSMeM", variant="primary")
-        api_status = gr.Markdown("⚪ Ready. No attempt runs without a valid API key.")
-        timeline_output = gr.HTML()
-        with gr.Accordion("Retrieved knowledge", open=True) as hkg_accordion:
-            hkg_output = gr.Markdown()
-        with gr.Accordion("Execution: plan, tool calls, and answer", open=True):
-            attempts_output = gr.Markdown()
-        with gr.Accordion("Automated evaluation", open=True):
-            evaluation_output = gr.Markdown()
-        with gr.Group(visible=False, elem_id="decision-panel") as decision_group:
-            gr.Markdown("### 👤 Review and confirm the result")
-            decision_output = gr.Markdown()
+            with gr.Accordion(
+                "📤 Use your own GeoTIFF files (optional)",
+                open=False,
+                elem_id="custom-upload-accordion",
+            ):
+                raster_input = gr.File(
+                    label="GeoTIFF files",
+                    file_count="multiple",
+                    file_types=[".tif", ".tiff"],
+                    type="filepath",
+                )
+                gr.Markdown(
+                    "**Accepted here:** `.tif` and `.tiff` GeoTIFF files. Uploaded files replace "
+                    "the bundled case data for this run. Single-band files are safest; recognizable "
+                    "band and date names improve automatic pairing. JPG, PNG, NetCDF, and HDF are not "
+                    "processed by this CPU deployment."
+                )
+            gr.Markdown("### Model connection")
             with gr.Row():
-                accept_button = gr.Button(
-                    "✅ Accept result and finish",
-                    variant="primary",
-                    elem_id="accept-result-button",
+                base_url_input = gr.Textbox(
+                    label="OpenAI-compatible Base URL",
+                    value=DEFAULT_BASE_URL,
+                    placeholder="https://provider.example/v1",
+                    info="Only public HTTPS endpoints are accepted.",
                 )
-                reflect_button = gr.Button(
-                    "⚠️ Result is wrong — reflect and retry",
-                    elem_id="retry-result-button",
+                model_input = gr.Textbox(
+                    label="Model",
+                    value=DEFAULT_MODEL,
+                    placeholder="Provider model identifier",
+                    info="Use the exact model identifier exposed by your provider.",
                 )
-        with gr.Group(visible=False) as candidate_group:
+            api_key_input = gr.Textbox(
+                label="API key",
+                type="password",
+                placeholder="Enter your key for this request",
+                info="Used for this run only and never saved by the Studio.",
+            )
+            run_button = gr.Button(
+                "Run RSMeM", variant="primary", elem_id="run-rsmem-button"
+            )
+
+        api_status = gr.Markdown(
+            "⚪ Ready. No attempt runs without a valid API key.",
+            elem_id="workflow-status",
+        )
+        timeline_output = gr.HTML(elem_id="workflow-timeline")
+
+        with gr.Row(visible=False, elem_id="rsmem-workspace") as workspace_group:
+            with gr.Column(
+                elem_id="task-result-panel", elem_classes=["workspace-panel"]
+            ):
+                gr.Markdown(
+                    "### Task & decision\nThe task, conclusion, and action that needs your attention.",
+                    elem_classes=["workspace-heading"],
+                )
+                final_output = gr.Markdown(
+                    "Run an example or upload your own rasters to see the result.",
+                    elem_id="current-result",
+                    elem_classes=["workspace-content"],
+                )
+                with gr.Group(visible=False, elem_id="decision-panel") as decision_group:
+                    gr.Markdown("### Review and confirm the result")
+                    decision_output = gr.Markdown()
+                    accept_button = gr.Button(
+                        "✓ Accept result and finish",
+                        variant="primary",
+                        elem_id="accept-result-button",
+                    )
+                    reflect_button = gr.Button(
+                        "↻ Incorrect — reflect and retry",
+                        elem_id="retry-result-button",
+                    )
+
+            with gr.Column(
+                elem_id="execution-panel", elem_classes=["workspace-panel"]
+            ):
+                gr.Markdown(
+                    "### Memory-evolution trace\nThe plan, real tool calls, and evidence-grounded answer.",
+                    elem_classes=["workspace-heading"],
+                )
+                with gr.Accordion("Inspect the complete attempt", open=True):
+                    attempts_output = gr.Markdown(elem_classes=["workspace-content"])
+
+            with gr.Column(
+                elem_id="evidence-panel", elem_classes=["workspace-panel"]
+            ):
+                gr.Markdown(
+                    "### Evidence & artifacts\nKnowledge, evaluation, and generated files.",
+                    elem_classes=["workspace-heading"],
+                )
+                with gr.Accordion("Retrieved knowledge", open=True) as hkg_accordion:
+                    hkg_output = gr.Markdown(elem_classes=["workspace-content"])
+                gr.Markdown("#### Automated evaluation")
+                evaluation_output = gr.Markdown(elem_id="evaluation-card")
+                with gr.Accordion("Generated files", open=True):
+                    artifact_output = gr.File(
+                        label="Download derived GeoTIFF artifacts", file_count="multiple"
+                    )
+
+        with gr.Group(
+            visible=False, elem_id="reflection-panel"
+        ) as candidate_group:
             gr.Markdown(
                 "### Reflection candidates\n\nCompare the three suggestions below, or write your own. "
                 "The selected text remains editable before the next attempt."
@@ -1692,9 +1853,6 @@ For uploaded data, you decide whether to accept the result or try again.
             retry_button = gr.Button(
                 "Confirm this reflection and execute the next attempt", variant="primary"
             )
-        with gr.Accordion("Result and downloads", open=True):
-            final_output = gr.Markdown()
-            artifact_output = gr.File(label="Download derived GeoTIFF artifacts", file_count="multiple")
 
         workflow_outputs = [
             session_state,
@@ -1716,6 +1874,7 @@ For uploaded data, you decide whether to accept the result or try again.
             edited_reflection,
             final_output,
             artifact_output,
+            workspace_group,
         ]
         run_button.click(
             start_interactive_workflow,
