@@ -144,6 +144,15 @@ EXAMPLES = {
 }
 DEFAULT_EXAMPLE = next(iter(EXAMPLES))
 
+PAPER_BIBTEX = r"""@article{wu2026rsmem,
+  title   = {RSMeM: Knowledge-Enhanced Memory Evolution for Remote Sensing Agents with Systematic Evaluation},
+  author  = {Wu, Bingxian and Zhang, Yu and Guo, Zonghao and Liu, Tang and Qian, Chen and Lu, Yuxiang and Du, Xingbo and Li, Yanghao and Zhang, Yidan and Chen, Chi and Yao, Ling and Sun, Maosong},
+  journal = {arXiv preprint arXiv:2607.24772},
+  year    = {2026},
+  doi     = {10.48550/arXiv.2607.24772},
+  url     = {https://arxiv.org/abs/2607.24772}
+}"""
+
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how",
     "in", "is", "of", "on", "or", "the", "to", "use", "using", "with",
@@ -412,6 +421,11 @@ Available executable CPU tool reference:
 
 
 def load_example(example_name: str):
+    if not example_name:
+        return (
+            "",
+            "No example loaded. Write your own query and attach GeoTIFFs, or select a prepared case below.",
+        )
     example = EXAMPLES.get(example_name, EXAMPLES[DEFAULT_EXAMPLE])
     return (
         example["query"],
@@ -1211,7 +1225,15 @@ def start_interactive_workflow(
     except ValueError as exc:
         raise gr.Error(f"Invalid Base URL: {exc}") from exc
     model = requested_model.strip() or DEFAULT_MODEL
-    example = EXAMPLES.get(example_name, EXAMPLES[DEFAULT_EXAMPLE])
+    if not example_name and not uploaded_files:
+        raise gr.Error(
+            "Attach GeoTIFF files for your own task, or load one of the prepared examples."
+        )
+    example = EXAMPLES.get(example_name) if example_name else {
+        "directory": None,
+        "query": query,
+        "description": "Visitor-provided task and rasters",
+    }
     run_dir = Path(tempfile.mkdtemp(prefix="rsmem_interactive_"))
     raster_paths, source = prepare_rasters(uploaded_files, run_dir, example_name)
     custom = bool(uploaded_files) or example["directory"] is None
@@ -1692,8 +1714,8 @@ Perception server is intentionally disabled in this free-CPU deployment.
             """
 ### Run RSMeM on an example or your own data
 
-1. Select a case example, or open **Use your own GeoTIFF files** to upload your data.
-2. Review or edit the task, then enter an OpenAI-compatible API connection.
+1. Write your own remote-sensing question and attach GeoTIFFs, or load a prepared example.
+2. Review the task, then enter an OpenAI-compatible API connection.
 3. Run RSMeM and inspect the knowledge, tool calls, outputs, and final answer.
 
 If a bundled result is incorrect, RSMeM will offer repair suggestions before the next attempt.
@@ -1702,42 +1724,42 @@ For uploaded data, you decide whether to accept the result or try again.
         )
         session_state = gr.State({})
         with gr.Group(elem_id="run-setup"):
+            gr.Markdown("### What do you want RSMeM to analyze?")
+            query_input = gr.Textbox(
+                label="Your remote-sensing query",
+                value="",
+                placeholder=(
+                    "Describe the analysis task, available raster bands or dates, "
+                    "and the result you want RSMeM to produce."
+                ),
+                lines=4,
+                info="This is your task. You can write it from scratch or load an example below.",
+            )
+            raster_input = gr.File(
+                label="Attach your GeoTIFF files",
+                file_count="multiple",
+                file_types=[".tif", ".tiff"],
+                type="filepath",
+            )
+            gr.Markdown(
+                "Upload `.tif` or `.tiff` files for your own query. Multiple files and multiband "
+                "GeoTIFFs are accepted; recognizable band and date names improve automatic pairing."
+            )
+            gr.Markdown("### Need inspiration? Load a prepared example")
             example_input = gr.Dropdown(
-                label="Case example",
-                choices=list(EXAMPLES),
-                value=DEFAULT_EXAMPLE,
+                label=f"Prepared remote-sensing cases ({len(EXAMPLES) - 1} available)",
+                choices=[name for name, item in EXAMPLES.items() if item["directory"]],
+                value=None,
+                info="Selecting a case fills the editable query and uses its bundled GeoTIFFs.",
             )
             dataset_info = gr.Markdown(
-                f"**Included data and workflow:** {EXAMPLES[DEFAULT_EXAMPLE]['description']}"
-            )
-            query_input = gr.Textbox(
-                label="Task for the agent",
-                value=EXAMPLES[DEFAULT_EXAMPLE]["query"],
-                lines=3,
-                info="You may edit the bundled task before running it.",
+                "No example loaded. Write your own query and attach GeoTIFFs, or select a prepared case."
             )
             example_input.change(
                 load_example,
                 inputs=[example_input],
                 outputs=[query_input, dataset_info],
             )
-            with gr.Accordion(
-                "📤 Use your own GeoTIFF files (optional)",
-                open=False,
-                elem_id="custom-upload-accordion",
-            ):
-                raster_input = gr.File(
-                    label="GeoTIFF files",
-                    file_count="multiple",
-                    file_types=[".tif", ".tiff"],
-                    type="filepath",
-                )
-                gr.Markdown(
-                    "**Accepted here:** `.tif` and `.tiff` GeoTIFF files. Uploaded files replace "
-                    "the bundled case data for this run. Single-band files are safest; recognizable "
-                    "band and date names improve automatic pairing. JPG, PNG, NetCDF, and HDF are not "
-                    "processed by this CPU deployment."
-                )
             gr.Markdown("### Model connection")
             with gr.Row():
                 base_url_input = gr.Textbox(
@@ -1759,7 +1781,7 @@ For uploaded data, you decide whether to accept the result or try again.
                 info="Used for this run only and never saved by the Studio.",
             )
             run_button = gr.Button(
-                "Run RSMeM", variant="primary", elem_id="run-rsmem-button"
+                "Analyze with RSMeM", variant="primary", elem_id="run-rsmem-button"
             )
 
         api_status = gr.Markdown(
@@ -1946,6 +1968,18 @@ The full repository contains experiment configurations, the evaluation pipeline,
 the original MCP servers, and deployment instructions for GPU perception services.
 This Studio connects the CPU-safe Index/Statistics subset directly so uploaded
 GeoTIFFs generate auditable and downloadable outputs without a GPU.
+
+### Cite the paper
+
+If RSMeM supports your research, please cite the arXiv paper:
+
+```bibtex
+{PAPER_BIBTEX}
+```
+
+[Paper abstract](https://arxiv.org/abs/2607.24772) ·
+[PDF](https://arxiv.org/pdf/2607.24772) ·
+[DOI](https://doi.org/10.48550/arXiv.2607.24772)
             """
         )
 
