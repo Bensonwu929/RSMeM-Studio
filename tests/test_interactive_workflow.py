@@ -94,6 +94,43 @@ class InteractiveWorkflowTests(unittest.TestCase):
         directories = {case["directory"] for case in app.EXAMPLES.values() if case["directory"]}
         self.assertEqual(directories, set(app.CASE_REFERENCES))
 
+    def test_raster_preview_is_display_ready_and_keeps_source_unchanged(self):
+        before = self.one_tif.stat().st_mtime_ns
+        preview = app.raster_preview([str(self.one_tif)])
+        self.assertEqual(preview.dtype.name, "uint8")
+        self.assertEqual(preview.ndim, 3)
+        self.assertEqual(preview.shape[2], 3)
+        self.assertLessEqual(max(preview.shape[:2]), 640)
+        self.assertEqual(before, self.one_tif.stat().st_mtime_ns)
+
+    def test_loading_case_returns_query_description_and_preview(self):
+        query, description, preview = app.load_example(self.case_name)
+        self.assertEqual(query, app.EXAMPLES[self.case_name]["query"])
+        self.assertIn("Included data and workflow", description)
+        self.assertEqual(preview.shape[2], 3)
+
+    def test_streaming_run_exposes_each_major_phase_before_final_result(self):
+        api = StudioApi(["correct"])
+        with patch.object(app, "api_completion", api):
+            updates = list(app.start_interactive_workflow_stream(
+                app.EXAMPLES[self.case_name]["query"], self.case_name, [],
+                "https://example.com/v1", "test-model", "private-test-key",
+            ))
+        self.assertEqual(len(updates), 5)
+        for update in updates:
+            self.assertEqual(len(update), 20)
+        progress_html = "\n".join(str(update[2]) for update in updates[:-1])
+        for label in ("Plan", "Execute", "Answer", "Evaluate"):
+            self.assertIn(label, progress_html)
+        self.assertEqual(updates[-1][0]["status"], "completed_case_correct")
+
+    def test_custom_query_requires_uploaded_rasters_when_no_case_is_loaded(self):
+        with self.assertRaisesRegex(Exception, "Attach GeoTIFF"):
+            app._initialize_interactive_workflow(
+                "Inspect my own data.", None, [], "https://example.com/v1",
+                "test-model", "private-test-key",
+            )
+
     def test_correct_case_evaluation_is_concise_and_hides_judge_json(self):
         summary = app._evaluation_summary_markdown({
             "verdict": "correct",

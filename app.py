@@ -15,7 +15,9 @@ from urllib.parse import urlparse
 
 import gradio as gr
 import numpy as np
+import rasterio
 from openai import OpenAI
+from rasterio.enums import Resampling
 
 from cpu_tools import (
     apparent_thermal_inertia,
@@ -420,16 +422,71 @@ Available executable CPU tool reference:
     return normalize_plan(extract_json_object(raw))
 
 
+def _normalize_preview_band(array: np.ndarray) -> np.ndarray:
+    values = np.asarray(array, dtype=np.float32)
+    finite = np.isfinite(values)
+    if not finite.any():
+        return np.zeros(values.shape, dtype=np.uint8)
+    low, high = np.nanpercentile(values[finite], [2, 98])
+    if high <= low:
+        high = low + 1.0
+    scaled = np.clip((values - low) / (high - low), 0, 1)
+    scaled[~finite] = 0
+    return np.round(scaled * 255).astype(np.uint8)
+
+
+def raster_preview(paths) -> np.ndarray | None:
+    """Build a lightweight CPU preview without changing the source rasters."""
+    raster_paths = [
+        Path(item) if isinstance(item, (str, os.PathLike)) else Path(item.name)
+        for item in (paths or [])
+    ]
+    raster_paths = [path for path in raster_paths if path.suffix.lower() in {".tif", ".tiff"} and path.is_file()]
+    if not raster_paths:
+        return None
+
+    channels = []
+    target_height = target_width = None
+    for path in raster_paths[:3]:
+        with rasterio.open(path) as src:
+            scale = min(1.0, 640 / max(src.height, src.width))
+            height = max(1, int(src.height * scale))
+            width = max(1, int(src.width * scale))
+            if target_height is None:
+                target_height, target_width = height, width
+            band = src.read(
+                1,
+                out_shape=(target_height, target_width),
+                masked=True,
+                resampling=Resampling.bilinear,
+            ).astype(np.float32).filled(np.nan)
+            channels.append(_normalize_preview_band(band))
+
+    if len(channels) == 1:
+        return np.repeat(channels[0][..., None], 3, axis=2)
+    if len(channels) == 2:
+        channels.append(np.round((channels[0].astype(float) + channels[1]) / 2).astype(np.uint8))
+    return np.stack(channels[:3], axis=2)
+
+
+def preview_uploaded_rasters(uploaded_files):
+    return raster_preview(uploaded_files)
+
+
 def load_example(example_name: str):
     if not example_name:
         return (
             "",
             "No example loaded. Write your own query and attach GeoTIFFs, or select a prepared case below.",
+            None,
         )
     example = EXAMPLES.get(example_name, EXAMPLES[DEFAULT_EXAMPLE])
+    directory = ROOT / "examples" / example["directory"] if example["directory"] else None
+    paths = sorted(directory.glob("*.tif")) if directory and directory.is_dir() else []
     return (
         example["query"],
         f"**Included data and workflow:** {example['description']}",
+        raster_preview(paths),
     )
 
 
@@ -1132,16 +1189,19 @@ def _reflection_trace(attempt: dict) -> list[dict]:
     return trajectory
 
 
-def _execute_interactive_attempt(state: dict, api_key: str) -> dict:
+def _execute_interactive_attempt_steps(state: dict, api_key: str):
     attempt_number = len(state["attempts"]) + 1
     memory = state["memory"][-1]["reflection"] if state["memory"] else ""
+    yield "plan", "Planning an evidence-grounded CPU tool chain with the selected model."
     plan = plan_toolchain(
         state["query"], state["knowledge_context"], memory,
         api_key, state["base_url"], state["model"],
     )
+    yield "execute", f"Executing {len(plan)} planned raster-tool step(s) on the real inputs."
     trajectory, executor_success, executor_reasons, executor_result, artifacts = execute_cpu_tools(
         plan, state["raster_paths"], Path(state["run_dir"]), attempt_number
     )
+    yield "answer", "Synthesizing the answer from verified tool observations."
     answer = synthesize_answer(
         api_call=api_completion, api_key=api_key,
         base_url=state["base_url"], model=state["model"],
@@ -1149,6 +1209,11 @@ def _execute_interactive_attempt(state: dict, api_key: str) -> dict:
         execution_result=executor_result,
     )
 
+    yield "evaluate", (
+        "Comparing the result with the case reference."
+        if state["mode"] == "case"
+        else "Running the Teacher Failure Gate; the user remains the final judge."
+    )
     if state["mode"] == "case":
         evaluation = judge_builtin_case(
             api_call=api_completion, api_key=api_key,
@@ -1203,17 +1268,52 @@ def _execute_interactive_attempt(state: dict, api_key: str) -> dict:
             if attempt_number >= state["max_attempts"]
             else "awaiting_user_decision"
         )
+    yield "complete", "The attempt is complete."
+
+
+def _execute_interactive_attempt(state: dict, api_key: str) -> dict:
+    for _phase, _detail in _execute_interactive_attempt_steps(state, api_key):
+        pass
     return state
 
 
-def start_interactive_workflow(
+def _processing_timeline(active_phase: str, detail: str) -> str:
+    stages = [
+        ("retrieve", "Retrieve", "domain knowledge"),
+        ("plan", "Plan", "tool chain"),
+        ("execute", "Execute", "CPU raster tools"),
+        ("answer", "Answer", "evidence synthesis"),
+        ("evaluate", "Evaluate", "judge or failure gate"),
+    ]
+    order = [item[0] for item in stages]
+    active_index = order.index(active_phase) if active_phase in order else len(order)
+    cards = []
+    for index, (key, name, caption) in enumerate(stages, start=1):
+        state_class = "done" if index - 1 < active_index else "current" if key == active_phase else "pending"
+        cards.append(
+            f'<div class="stage {state_class}"><span>{index}</span><b>{name}</b><small>{caption}</small></div>'
+        )
+    return (
+        '<div class="run-progress-panel">'
+        '<div class="run-progress-heading"><span class="run-pulse"></span>'
+        '<div><b>RSMeM is working</b><small>' + detail + '</small></div></div>'
+        '<div class="pipeline processing-pipeline">' + "".join(cards) + '</div></div>'
+    )
+
+
+def _stream_update(state: dict, phase: str, detail: str):
+    status = f"### RSMeM is working\n\n{detail}"
+    return (state, status, _processing_timeline(phase, detail), *[gr.skip() for _ in range(17)])
+
+
+def _initialize_interactive_workflow(
     query: str,
     example_name: str,
     uploaded_files,
     requested_base_url: str,
     requested_model: str,
     user_api_key: str,
-):
+) -> tuple[dict, str]:
     query = query.strip()
     if not query:
         raise gr.Error("A remote-sensing task is required.")
@@ -1259,11 +1359,46 @@ def start_interactive_workflow(
         "candidates": {},
         "artifacts": [],
     }
+    return state, api_key
+
+
+def start_interactive_workflow(
+    query: str,
+    example_name: str,
+    uploaded_files,
+    requested_base_url: str,
+    requested_model: str,
+    user_api_key: str,
+):
+    state, api_key = _initialize_interactive_workflow(
+        query, example_name, uploaded_files, requested_base_url, requested_model, user_api_key
+    )
     try:
         state = _execute_interactive_attempt(state, api_key)
     except Exception as exc:
         raise gr.Error(f"Attempt 1 failed: {exc}") from exc
     return (state, *_render_interactive_state(state))
+
+
+def start_interactive_workflow_stream(
+    query: str,
+    example_name: str,
+    uploaded_files,
+    requested_base_url: str,
+    requested_model: str,
+    user_api_key: str,
+):
+    state, api_key = _initialize_interactive_workflow(
+        query, example_name, uploaded_files, requested_base_url, requested_model, user_api_key
+    )
+    try:
+        for phase, detail in _execute_interactive_attempt_steps(state, api_key):
+            if phase == "complete":
+                yield (state, *_render_interactive_state(state))
+            else:
+                yield _stream_update(state, phase, detail)
+    except Exception as exc:
+        raise gr.Error(f"Attempt 1 failed: {exc}") from exc
 
 
 def _attempts_interactive_markdown(state: dict) -> str:
@@ -1603,8 +1738,6 @@ CSS = """
   padding:0 !important;
 }
 .gradio-container > .main {max-width:1600px !important; margin:0 auto !important; padding:0 22px 28px !important;}
-.gradio-container .block label span {background:#eeeeee !important; color:#242424 !important;}
-#run-setup .container > span {background:#eeeeee !important; color:#242424 !important;}
 .gradio-container a {color:#444444 !important;}
 .hero {display:flex; align-items:center; justify-content:center; gap:10px; padding:22px 0 12px;}
 .hero h1 {font-size:25px !important; line-height:1.2 !important; margin:0 !important; letter-spacing:-.02em;}
@@ -1613,9 +1746,17 @@ CSS = """
 
 /* Progress strip */
 #workflow-status {margin-top:12px;}
-#workflow-status .prose {font-size:13px !important; color:#626262;}
-#workflow-status h3 {font-size:14px !important; margin:0 0 4px !important; color:#242424;}
+#workflow-status {background:#ffffff !important; border:1px solid #dedede !important; border-radius:13px !important; padding:12px 14px !important;}
+#workflow-status .prose {font-size:14px !important; color:#555555;}
+#workflow-status h3 {font-size:17px !important; margin:0 0 5px !important; color:#242424;}
 #workflow-timeline {border:0 !important; background:transparent !important; padding:0 !important;}
+.run-progress-panel {background:#ffffff; border:1px solid #d7d7d7; border-radius:14px; padding:14px; margin:9px 0 12px; box-shadow:0 8px 24px rgba(0,0,0,.035);}
+.run-progress-heading {display:flex; align-items:center; gap:11px; margin-bottom:11px;}
+.run-progress-heading b {display:block; font-size:16px; color:#242424;}
+.run-progress-heading small {display:block; margin-top:3px; font-size:12px; color:#686868;}
+.run-pulse {width:14px; height:14px; border-radius:50%; background:#242424; box-shadow:0 0 0 0 rgba(36,36,36,.25); animation:rsmem-pulse 1.35s infinite; flex:none;}
+@keyframes rsmem-pulse {0%{box-shadow:0 0 0 0 rgba(36,36,36,.28)}70%{box-shadow:0 0 0 10px rgba(36,36,36,0)}100%{box-shadow:0 0 0 0 rgba(36,36,36,0)}}
+.processing-pipeline {grid-template-columns:repeat(5,minmax(112px,1fr)) !important; margin-bottom:0 !important;}
 .pipeline {display:grid; grid-template-columns:repeat(7,minmax(112px,1fr)); gap:7px; margin:10px 0 11px;}
 .stage {min-width:0; border-radius:11px; padding:10px; border:1px solid #e2e2e2; background:#ffffff; color:#262626;}
 .stage span {display:inline-flex; width:22px; height:22px; border-radius:50%; align-items:center; justify-content:center; margin-right:6px; background:#ededed; color:#555555; font-size:11px;}
@@ -1635,8 +1776,20 @@ CSS = """
 .attempt.fail strong {color:#b54735;}
 
 /* Setup and workspace */
-#run-setup {background:#ffffff; border:1px solid #e3e3e3; border-radius:16px; padding:16px !important; margin-top:8px; box-shadow:0 8px 24px rgba(0,0,0,.025);}
-#run-setup h3 {font-size:14px !important; margin-top:0 !important;}
+#run-setup {background:#ffffff; border:1px solid #e3e3e3; border-radius:16px; padding:14px !important; margin-top:8px; box-shadow:0 8px 24px rgba(0,0,0,.025);}
+#run-setup h3 {font-size:16px !important; margin:0 0 4px !important; background:transparent !important;}
+#run-setup .prose {background:transparent !important;}
+#run-setup [data-testid="block-info"] {background:transparent !important; color:#242424 !important; padding:0 !important; border-radius:0 !important;}
+#run-input-layout {gap:14px !important; align-items:stretch !important;}
+.run-input-panel, .run-preview-panel {min-width:0 !important; padding:13px !important; border:1px solid #e6e6e6 !important; border-radius:13px !important; background:#ffffff !important;}
+.run-input-panel .label-wrap, .run-preview-panel .label-wrap {background:transparent !important; color:#242424 !important; font-weight:650 !important; padding-left:0 !important;}
+#raster-upload {min-height:128px !important; max-height:148px !important; overflow:hidden !important; border:1px dashed #bdbdbd !important; border-radius:11px !important;}
+#raster-upload .wrap, #raster-upload .container {min-height:112px !important; padding:10px !important;}
+.upload-help .prose, .preview-note .prose {font-size:11px !important; color:#777777 !important; margin-top:-4px !important;}
+#raster-preview {min-height:390px !important; height:390px !important; border-radius:11px !important; overflow:hidden !important; background:#f1f1f1 !important;}
+#raster-preview img {object-fit:contain !important; max-height:390px !important;}
+#example-picker, #model-connection {border:1px solid #dedede !important; border-radius:11px !important; background:#fafafa !important;}
+#example-picker > button, #model-connection > button {font-weight:700 !important; color:#242424 !important;}
 #custom-upload-accordion {border:1px solid #cfcfcf !important; background:#fafafa !important; border-radius:11px !important;}
 #custom-upload-accordion button,
 #custom-upload-accordion .label-wrap {font-weight:700 !important; color:#252525 !important;}
@@ -1679,6 +1832,10 @@ footer {visibility:hidden; height:0;}
   .hero {display:block; text-align:center;}
   .hero p {margin-top:5px !important;}
   .pipeline {grid-template-columns:repeat(2,minmax(0,1fr));}
+  .processing-pipeline {grid-template-columns:repeat(2,minmax(0,1fr)) !important;}
+  #run-input-layout {display:block !important;}
+  .run-input-panel {margin-bottom:10px !important;}
+  #raster-preview {height:300px !important; min-height:300px !important;}
   #rsmem-workspace {display:block !important;}
   .workspace-panel {margin-bottom:10px !important;}
 }
@@ -1724,62 +1881,97 @@ For uploaded data, you decide whether to accept the result or try again.
         )
         session_state = gr.State({})
         with gr.Group(elem_id="run-setup"):
-            gr.Markdown("### What do you want RSMeM to analyze?")
-            query_input = gr.Textbox(
-                label="Your remote-sensing query",
-                value="",
-                placeholder=(
-                    "Describe the analysis task, available raster bands or dates, "
-                    "and the result you want RSMeM to produce."
-                ),
-                lines=4,
-                info="This is your task. You can write it from scratch or load an example below.",
-            )
-            raster_input = gr.File(
-                label="Attach your GeoTIFF files",
-                file_count="multiple",
-                file_types=[".tif", ".tiff"],
-                type="filepath",
-            )
-            gr.Markdown(
-                "Upload `.tif` or `.tiff` files for your own query. Multiple files and multiband "
-                "GeoTIFFs are accepted; recognizable band and date names improve automatic pairing."
-            )
-            gr.Markdown("### Need inspiration? Load a prepared example")
-            example_input = gr.Dropdown(
-                label=f"Prepared remote-sensing cases ({len(EXAMPLES) - 1} available)",
-                choices=[name for name, item in EXAMPLES.items() if item["directory"]],
-                value=None,
-                info="Selecting a case fills the editable query and uses its bundled GeoTIFFs.",
-            )
-            dataset_info = gr.Markdown(
-                "No example loaded. Write your own query and attach GeoTIFFs, or select a prepared case."
-            )
+            with gr.Row(elem_id="run-input-layout"):
+                with gr.Column(scale=5, elem_classes=["run-input-panel"]):
+                    gr.Markdown(
+                        "### What do you want RSMeM to analyze?\n"
+                        "Write your own task first. Raster files are optional only when you load a prepared case."
+                    )
+                    query_input = gr.Textbox(
+                        label="Your remote-sensing query",
+                        value="",
+                        placeholder=(
+                            "Describe the analysis task, available raster bands or dates, "
+                            "and the result you want RSMeM to produce."
+                        ),
+                        lines=5,
+                        info="Write this from scratch or load an editable example below.",
+                    )
+                    raster_input = gr.File(
+                        label="Attach GeoTIFF files for your own task",
+                        file_count="multiple",
+                        file_types=[".tif", ".tiff"],
+                        type="filepath",
+                        elem_id="raster-upload",
+                    )
+                    gr.Markdown(
+                        "`.tif` and `.tiff` · multiple files and multiband rasters supported",
+                        elem_classes=["upload-help"],
+                    )
+                    with gr.Accordion(
+                        f"Need inspiration? Load one of {len(EXAMPLES) - 1} prepared cases",
+                        open=False,
+                        elem_id="example-picker",
+                    ):
+                        example_input = gr.Dropdown(
+                            label="Prepared remote-sensing case",
+                            choices=[name for name, item in EXAMPLES.items() if item["directory"]],
+                            value=None,
+                            info="This fills the query and loads bundled GeoTIFFs; the query remains editable.",
+                        )
+                        dataset_info = gr.Markdown(
+                            "No example loaded. Choose a case to inspect its data and workflow."
+                        )
+                with gr.Column(scale=7, elem_classes=["run-preview-panel"]):
+                    gr.Markdown(
+                        "### Raster preview\n"
+                        "A lightweight preview of the selected example or your uploaded GeoTIFFs."
+                    )
+                    raster_preview_output = gr.Image(
+                        value=None,
+                        type="numpy",
+                        interactive=False,
+                        show_label=False,
+                        elem_id="raster-preview",
+                    )
+                    gr.Markdown(
+                        "Input previews are contrast-stretched for display; RSMeM executes on the original values.",
+                        elem_classes=["preview-note"],
+                    )
             example_input.change(
                 load_example,
                 inputs=[example_input],
-                outputs=[query_input, dataset_info],
+                outputs=[query_input, dataset_info, raster_preview_output],
             )
-            gr.Markdown("### Model connection")
-            with gr.Row():
-                base_url_input = gr.Textbox(
-                    label="OpenAI-compatible Base URL",
-                    value=DEFAULT_BASE_URL,
-                    placeholder="https://provider.example/v1",
-                    info="Only public HTTPS endpoints are accepted.",
-                )
-                model_input = gr.Textbox(
-                    label="Model",
-                    value=DEFAULT_MODEL,
-                    placeholder="Provider model identifier",
-                    info="Use the exact model identifier exposed by your provider.",
-                )
-            api_key_input = gr.Textbox(
-                label="API key",
-                type="password",
-                placeholder="Enter your key for this request",
-                info="Used for this run only and never saved by the Studio.",
+            raster_input.change(
+                preview_uploaded_rasters,
+                inputs=[raster_input],
+                outputs=[raster_preview_output],
             )
+            with gr.Accordion(
+                "Model connection — required to run",
+                open=False,
+                elem_id="model-connection",
+            ):
+                with gr.Row():
+                    base_url_input = gr.Textbox(
+                        label="OpenAI-compatible Base URL",
+                        value=DEFAULT_BASE_URL,
+                        placeholder="https://provider.example/v1",
+                        info="Only public HTTPS endpoints are accepted.",
+                    )
+                    model_input = gr.Textbox(
+                        label="Model",
+                        value=DEFAULT_MODEL,
+                        placeholder="Provider model identifier",
+                        info="Use the exact model identifier exposed by your provider.",
+                    )
+                api_key_input = gr.Textbox(
+                    label="API key",
+                    type="password",
+                    placeholder="Enter your key for this request",
+                    info="Used for this run only and never saved by the Studio.",
+                )
             run_button = gr.Button(
                 "Analyze with RSMeM", variant="primary", elem_id="run-rsmem-button"
             )
@@ -1899,7 +2091,7 @@ For uploaded data, you decide whether to accept the result or try again.
             workspace_group,
         ]
         run_button.click(
-            start_interactive_workflow,
+            start_interactive_workflow_stream,
             inputs=[
                 query_input,
                 example_input,
@@ -1909,6 +2101,7 @@ For uploaded data, you decide whether to accept the result or try again.
                 api_key_input,
             ],
             outputs=workflow_outputs,
+            show_progress="minimal",
         )
         accept_button.click(
             accept_custom_result,
