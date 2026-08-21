@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ast
 import copy
+import html as html_lib
 import json
 import ipaddress
 import os
 import re
+import secrets
 import socket
 import tempfile
 from pathlib import Path
@@ -16,8 +18,12 @@ from urllib.parse import urlparse
 import gradio as gr
 import numpy as np
 import rasterio
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from openai import OpenAI
 from rasterio.enums import Resampling
+
+import modelscope_oauth as msoauth
 
 from mcp_runtime import (
     apparent_thermal_inertia,
@@ -78,6 +84,10 @@ GITHUB_URL = "https://github.com/AI9Stars/RSMeM"
 LEARN_URL = "https://modelscope.cn/learn/435887"
 DEFAULT_BASE_URL = "https://uni-api.cstcloud.cn/v1"
 DEFAULT_MODEL = "deepseek-v4-flash-aistar"
+MODE_MODELSCOPE = "ModelScope quota"
+MODE_OPENAI = "OpenAI-compatible API"
+MODELSCOPE_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+STUDIO_DIRECT_URL = "https://wbx929-rsmem.ms.show"
 
 EXAMPLES = {
     "🌾 Sichuan drought severity — derive TVDI and quantify severe-dryness pixels": {
@@ -1421,37 +1431,52 @@ def start_interactive_workflow_stream(
         raise gr.Error(f"Attempt 1 failed: {exc}") from exc
 
 
-def _attempts_interactive_markdown(state: dict) -> str:
+def _esc(value) -> str:
+    return html_lib.escape(str(value), quote=True)
+
+
+def _attempts_interactive_html(state: dict) -> str:
+    """Render attempts as step cards; Markdown tables collapse at narrow widths."""
     sections = []
     for attempt in state.get("attempts", []):
-        section = [
-            f"### Attempt {attempt['attempt']}",
-            f"**Context:** HKG = {'yes' if attempt['context'].get('hkg') else 'no'} · "
-            f"selected FAM = {'yes' if attempt['context']['far_memory'] else 'no'}",
-            "\n#### Planned tool chain",
-            "| Step | Tool | Purpose |",
-            "|---:|---|---|",
-        ]
-        for index, step in enumerate(attempt["tool_plan"], 1):
-            section.append(
-                f"| {index} | `{step['tool']}` | {str(step['purpose']).replace('|', '\\|')} |"
-            )
-        section.extend([
-            "\n#### Real execution trajectory",
-            "| Step | Tool | Status | Observation |",
-            "|---:|---|---|---|",
-        ])
+        plan_items = "".join(
+            f'<li><code>{_esc(step["tool"])}</code>'
+            f'<span class="why">{_esc(step.get("purpose", ""))}</span></li>'
+            for step in attempt["tool_plan"]
+        )
+        step_cards = []
         for step in attempt["trajectory"]:
-            observation = str(step["observation"]).replace("|", "\\|")
-            section.append(
-                f"| {step['step']} | `{step['tool']}` | {step['status']} | {observation} |"
+            ok = step["status"] == "success"
+            badge = (
+                '<span class="badge ok">success</span>'
+                if ok
+                else '<span class="badge err">error</span>'
             )
-        section.extend([
-            "\n#### Answer synthesized from tool evidence",
-            attempt["answer"],
-        ])
-        sections.append("\n".join(section))
-    return "\n\n---\n\n".join(sections)
+            step_cards.append(
+                '<details class="step-card" open>'
+                f'<summary><span class="num">{_esc(step["step"])}</span>'
+                f'<code>{_esc(step["tool"])}</code>{badge}</summary>'
+                f'<div class="step-obs">{_esc(step["observation"])}</div>'
+                "</details>"
+            )
+        context_line = (
+            f"Context: HKG = {'yes' if attempt['context'].get('hkg') else 'no'} · "
+            f"selected FAM = {'yes' if attempt['context']['far_memory'] else 'no'}"
+        )
+        sections.append(
+            '<div class="trace-attempt">'
+            f'<div class="attempt-head">Attempt {_esc(attempt["attempt"])}</div>'
+            f'<div class="ctx-line">{_esc(context_line)}</div>'
+            '<div class="block-label">Planned tool chain</div>'
+            f'<ol class="plan">{plan_items}</ol>'
+            '<div class="block-label">Real execution trajectory</div>'
+            f"{''.join(step_cards)}"
+            '<div class="block-label">Answer synthesized from tool evidence</div>'
+            f'<div class="attempt-answer">{_esc(attempt["answer"])}</div>'
+            "</div>"
+        )
+    joined = '<hr class="trace-divider">'.join(sections)
+    return f'<div class="agent-trace">{joined}</div>'
 
 
 def _interactive_timeline(state: dict) -> str:
@@ -1626,7 +1651,7 @@ def _render_interactive_state(state: dict):
         _interactive_timeline(state),
         state.get("knowledge_markdown", ""),
         gr.update(visible=show_knowledge),
-        _attempts_interactive_markdown(state),
+        _attempts_interactive_html(state),
         _evaluation_summary_markdown(evaluation, state.get("mode", "case")),
         decision,
         gr.update(visible=show_decision),
@@ -1735,14 +1760,175 @@ def confirm_reflection_and_retry(
     return (updated, *_render_interactive_state(updated))
 
 
+def _session_id_from_request(request) -> str | None:
+    cookies = dict(getattr(request, "cookies", None) or {})
+    return cookies.get(msoauth.SESSION_COOKIE) or None
+
+
+def _resolve_connection(
+    mode: str,
+    ms_model: str,
+    base_url: str,
+    model: str,
+    api_key: str,
+    request,
+) -> tuple[str, str, str]:
+    """Map the selected connection mode to (base_url, model, api_key).
+
+    Credentials are resolved strictly by mode: the ModelScope session token is
+    never used in OpenAI mode and the pasted key is never used in ModelScope
+    mode. Without a valid authorization nothing runs — there is no fallback.
+    """
+    if mode == MODE_MODELSCOPE:
+        if not msoauth.oauth_configured():
+            raise gr.Error(
+                "ModelScope quota mode is not configured on this deployment yet. "
+                "Switch to the OpenAI-compatible API mode, or ask the Studio owner "
+                "to set OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET."
+            )
+        token = msoauth.SESSION_STORE.get_token(_session_id_from_request(request))
+        if not token:
+            raise gr.Error(
+                "Sign in with ModelScope first. RSMeM runs only with your own "
+                "API-Inference authorization and never uses a preset token."
+            )
+        return (
+            msoauth.INFERENCE_BASE_URL,
+            (ms_model or "").strip() or MODELSCOPE_DEFAULT_MODEL,
+            token,
+        )
+    api_key = (api_key or "").strip() or os.getenv("RSMEM_API_KEY", "")
+    if not api_key:
+        raise gr.Error("API key is required; the Studio has no preset planner or judge.")
+    return ((base_url or "").strip() or DEFAULT_BASE_URL, (model or "").strip() or DEFAULT_MODEL, api_key)
+
+
+def _ms_status_html(request) -> tuple[str, bool]:
+    """Build the ModelScope session status box. Returns (html, signed_in)."""
+    if not msoauth.oauth_configured():
+        return (
+            '<div class="auth-box"><div class="st"><span class="dot">●</span> '
+            "ModelScope quota mode · not configured on this deployment</div>"
+            "<p>The Studio owner has not set the OAuth client yet. Use the "
+            "OpenAI-compatible API mode instead.</p></div>",
+            False,
+        )
+    session_id = _session_id_from_request(request)
+    if not session_id:
+        return (
+            '<div class="auth-box"><div class="st"><span class="dot">●</span> '
+            "ModelScope session · cookies unavailable</div>"
+            "<p>Your browser blocked the session cookie. Open the Studio "
+            f'directly at <a href="{STUDIO_DIRECT_URL}" target="_blank" '
+            f'rel="noopener">{STUDIO_DIRECT_URL}</a> and sign in there.</p></div>',
+            False,
+        )
+    session = msoauth.SESSION_STORE.get_session(session_id)
+    if session:
+        user = _esc(session.get("user", "ModelScope user"))
+        return (
+            '<div class="auth-box connected"><div class="st ok"><span class="dot">●</span> '
+            f"Signed in as <b>{user}</b> · runs use your own API-Inference quota</div>"
+            "<p>The token stays in this browser session only and is never stored "
+            "by the Studio. Requires an Alibaba Cloud-bound, real-name verified "
+            "ModelScope account.</p></div>",
+            True,
+        )
+    nonce = msoauth.SESSION_STORE.mint_login_nonce(session_id)
+    return (
+        '<div class="auth-box"><div class="st"><span class="dot">●</span> '
+        "ModelScope session · not connected</div>"
+        "<p>Authorize API-Inference for this browser session — no key field is "
+        "needed. The sign-in page opens in a new tab; afterwards return here "
+        "and press <b>Refresh sign-in status</b>.</p>"
+        f'<a class="ms-signin" href="oauth/login?nonce={nonce}" target="_blank" '
+        'rel="noopener">Sign in with ModelScope</a></div>',
+        False,
+    )
+
+
+def refresh_ms_session(request: gr.Request):
+    status_html, signed_in = _ms_status_html(request)
+    return status_html, gr.update(visible=signed_in)
+
+
+def sign_out_ms(request: gr.Request):
+    msoauth.SESSION_STORE.clear(_session_id_from_request(request))
+    return refresh_ms_session(request)
+
+
+def switch_connection_mode(mode: str):
+    """Toggle the mode panes and drop the other mode's pasted credential."""
+    is_ms = mode == MODE_MODELSCOPE
+    return (
+        gr.update(visible=is_ms),
+        gr.update(visible=not is_ms),
+        gr.update(value="") if is_ms else gr.skip(),
+    )
+
+
+def start_workflow_ui(
+    query: str,
+    example_name: str,
+    uploaded_files,
+    mode: str,
+    ms_model: str,
+    requested_base_url: str,
+    requested_model: str,
+    user_api_key: str,
+    request: gr.Request,
+):
+    base_url, model, api_key = _resolve_connection(
+        mode, ms_model, requested_base_url, requested_model, user_api_key, request
+    )
+    yield from start_interactive_workflow_stream(
+        query, example_name, uploaded_files, base_url, model, api_key
+    )
+
+
+def request_custom_reflections_ui(
+    state: dict,
+    mode: str,
+    ms_model: str,
+    requested_base_url: str,
+    requested_model: str,
+    user_api_key: str,
+    request: gr.Request,
+):
+    _, _, api_key = _resolve_connection(
+        mode, ms_model, requested_base_url, requested_model, user_api_key, request
+    )
+    return request_custom_reflections(state, api_key)
+
+
+def confirm_reflection_and_retry_ui(
+    state: dict,
+    selection: str,
+    edited_reflection: str,
+    user_diagnosis: str,
+    user_plan: str,
+    mode: str,
+    ms_model: str,
+    requested_base_url: str,
+    requested_model: str,
+    user_api_key: str,
+    request: gr.Request,
+):
+    _, _, api_key = _resolve_connection(
+        mode, ms_model, requested_base_url, requested_model, user_api_key, request
+    )
+    return confirm_reflection_and_retry(
+        state, selection, edited_reflection, user_diagnosis, user_plan, api_key
+    )
+
+
 CSS = """
-/* Codex-inspired neutral system: color communicates state, never decoration. */
+/* Codex-inspired neutral system: single column, one border per card. */
 .gradio-container {
   --background-fill-primary: #f7f7f7;
   --background-fill-secondary: #ffffff;
   --block-background-fill: #ffffff;
   --block-border-color: #e3e3e3;
-  --block-label-background-fill: transparent;
   --block-title-text-color: #242424;
   --body-text-color: #242424;
   --body-text-color-subdued: #737373;
@@ -1757,35 +1943,76 @@ CSS = """
   max-width:none !important;
   padding:0 !important;
 }
-.gradio-container > .main {max-width:1600px !important; margin:0 auto !important; padding:0 22px 28px !important;}
+.gradio-container > .main {max-width:1020px !important; margin:0 auto !important; padding:0 22px 40px !important;}
 .gradio-container a {color:#444444 !important;}
-.hero {display:flex; align-items:center; justify-content:center; gap:10px; padding:22px 0 12px;}
-.hero h1 {font-size:25px !important; line-height:1.2 !important; margin:0 !important; letter-spacing:-.02em;}
+.hero {display:flex; align-items:center; justify-content:center; gap:10px; padding:22px 0 10px;}
+.hero h1 {font-size:24px !important; line-height:1.2 !important; margin:0 !important; letter-spacing:-.02em;}
 .hero p {margin:0 !important; color:#737373; font-size:13px;}
 .note {border-left:3px solid #262626; padding:.75rem 1rem; background:#f1f1f1;}
+.run-overview {display:flex; align-items:center; justify-content:space-between; gap:18px; padding:13px 15px; margin:2px 0 10px; border:1px solid #e3e3e3; border-radius:14px; background:#ffffff;}
+.run-overview-copy {min-width:230px;}
+.run-overview-copy b {display:block; font-size:14px; line-height:1.35; color:#242424;}
+.run-overview-copy span {display:block; margin-top:3px; font-size:11px; line-height:1.45; color:#737373;}
+.run-overview-flow {display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:6px;}
+.run-overview-flow span {display:inline-flex; align-items:center; min-height:27px; padding:0 9px; border:1px solid #dddddd; border-radius:999px; background:#fafafa; color:#444444; font-size:11px; font-weight:650; white-space:nowrap;}
+.run-overview-flow i {color:#aaaaaa; font-size:11px; font-style:normal;}
+#method-overview {margin-top:14px; border:1px solid #dedede !important; border-radius:12px !important; background:#fafafa !important;}
+#method-overview > button {font-weight:700 !important; color:#242424 !important;}
+
+/* Cards: input + model service */
+#input-card, #model-service {background:#ffffff !important; border:1px solid #e3e3e3 !important; border-radius:14px !important; padding:18px 20px !important; margin-top:14px;}
+.card-heading h3 {font-size:15px !important; margin:0 0 2px !important;}
+.card-heading p {font-size:12.5px !important; color:#737373 !important; margin:0 0 10px !important;}
+#attach-row {gap:14px !important; margin-top:4px;}
+.upload-heading p {font-size:12.5px !important; color:#555555 !important; margin:0 0 6px !important;}
+#raster-upload {border:1px dashed #bdbdbd !important; border-radius:10px !important; background:#fcfcfc !important; min-height:150px;}
+#raster-upload:hover {border-color:#8a8a8a !important;}
+#raster-preview {border-radius:10px !important; overflow:hidden !important; background:#f1f1f1 !important;}
+#raster-preview img {object-fit:contain !important;}
+#example-picker {border:1px solid #e3e3e3 !important; border-radius:10px !important; background:#fafafa !important; margin-top:12px;}
+#example-picker > button {font-weight:650 !important; color:#242424 !important;}
+
+/* Connection mode segmented control */
+#connection-mode {border:0 !important; background:transparent !important; padding:0 !important;}
+#connection-mode .wrap {display:flex !important; gap:0 !important; border:1px solid #d4d4d4; border-radius:10px; overflow:hidden; flex-wrap:nowrap !important;}
+#connection-mode label {flex:1 1 50%; margin:0 !important; border-radius:0 !important; padding:11px 16px !important; background:#fafafa !important; border:0 !important; font-weight:600; justify-content:center;}
+#connection-mode label + label {border-left:1px solid #d4d4d4 !important;}
+#connection-mode label.selected, #connection-mode label:has(input:checked) {background:#ffffff !important; box-shadow:inset 0 -2px 0 #202020 !important;}
+#connection-mode input[type=radio] {position:absolute; opacity:0; pointer-events:none;}
+#ms-pane, #oa-pane {border:0 !important; box-shadow:none !important; background:transparent !important; padding:0 !important; margin-top:12px;}
+.auth-box {border-left:3px solid #d4d4d4; background:#fafafa; border-radius:0 8px 8px 0; padding:12px 16px;}
+.auth-box .st {font-weight:600; font-size:13px;}
+.auth-box .st .dot {color:#9a9a9a; margin-right:4px;}
+.auth-box .st.ok .dot {color:#18794e;}
+.auth-box p {font-size:12.5px; color:#737373; margin:4px 0 0;}
+.auth-box .ms-signin {display:block; margin-top:12px; background:#202020; color:#ffffff !important; text-align:center; font-weight:650; border-radius:9px; padding:11px 18px; text-decoration:none;}
+.auth-box .ms-signin:hover {background:#333333;}
+#ms-refresh, #ms-signout {max-width:220px;}
+
+/* Run button: strong but not full-bleed */
+#run-row {justify-content:center !important; margin-top:16px;}
+#run-rsmem-button {flex:0 1 340px !important; min-width:260px !important; min-height:46px !important; font-weight:700 !important;}
 
 /* Progress strip */
-#workflow-status {margin-top:12px;}
-#workflow-status {background:#ffffff !important; border:1px solid #dedede !important; border-radius:13px !important; padding:12px 14px !important;}
+#workflow-status {margin-top:14px; background:#ffffff !important; border:1px solid #dedede !important; border-radius:12px !important; padding:12px 14px !important;}
 #workflow-status .prose {font-size:14px !important; color:#555555;}
-#workflow-status h3 {font-size:17px !important; margin:0 0 5px !important; color:#242424;}
+#workflow-status h3 {font-size:16px !important; margin:0 0 5px !important; color:#242424;}
 #workflow-timeline {border:0 !important; background:transparent !important; padding:0 !important;}
-.run-progress-panel {background:#ffffff; border:1px solid #d7d7d7; border-radius:14px; padding:14px; margin:9px 0 12px; box-shadow:0 8px 24px rgba(0,0,0,.035);}
+.run-progress-panel {background:#ffffff; border:1px solid #d7d7d7; border-radius:12px; padding:14px; margin:9px 0 12px;}
 .run-progress-heading {display:flex; align-items:center; gap:11px; margin-bottom:11px;}
-.run-progress-heading b {display:block; font-size:16px; color:#242424;}
+.run-progress-heading b {display:block; font-size:15px; color:#242424;}
 .run-progress-heading small {display:block; margin-top:3px; font-size:12px; color:#686868;}
-.run-pulse {width:14px; height:14px; border-radius:50%; background:#242424; box-shadow:0 0 0 0 rgba(36,36,36,.25); animation:rsmem-pulse 1.35s infinite; flex:none;}
+.run-pulse {width:12px; height:12px; border-radius:50%; background:#242424; box-shadow:0 0 0 0 rgba(36,36,36,.25); animation:rsmem-pulse 1.35s infinite; flex:none;}
 @keyframes rsmem-pulse {0%{box-shadow:0 0 0 0 rgba(36,36,36,.28)}70%{box-shadow:0 0 0 10px rgba(36,36,36,0)}100%{box-shadow:0 0 0 0 rgba(36,36,36,0)}}
 .processing-pipeline {grid-template-columns:repeat(5,minmax(112px,1fr)) !important; margin-bottom:0 !important;}
-.pipeline {display:grid; grid-template-columns:repeat(7,minmax(112px,1fr)); gap:7px; margin:10px 0 11px;}
-.stage {min-width:0; border-radius:11px; padding:10px; border:1px solid #e2e2e2; background:#ffffff; color:#262626;}
-.stage span {display:inline-flex; width:22px; height:22px; border-radius:50%; align-items:center; justify-content:center; margin-right:6px; background:#ededed; color:#555555; font-size:11px;}
+.pipeline {display:grid; grid-template-columns:repeat(7,minmax(100px,1fr)); gap:7px; margin:10px 0 11px;}
+.stage {min-width:0; border-radius:9px; padding:9px 10px; border:1px solid #e2e2e2; background:#ffffff; color:#262626;}
+.stage span {display:inline-flex; width:20px; height:20px; border-radius:50%; align-items:center; justify-content:center; margin-right:6px; background:#ededed; color:#555555; font-size:11px;}
 .stage b {display:inline-block; font-size:12px;}
-.stage small {display:block; margin-top:6px; color:#777777; font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.stage small {display:block; margin-top:5px; color:#777777; font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
 .stage.done {border-color:#d5d5d5; background:#fafafa;}
-.stage.done span {background:#252525; color:#ffffff;}
-.stage.current {border-color:#999999; background:#eeeeee; box-shadow:0 0 0 3px rgba(0,0,0,.05);}
-.stage.current span {background:#252525; color:#ffffff;}
+.stage.done span, .stage.current span {background:#252525; color:#ffffff;}
+.stage.current {border-color:#999999; background:#eeeeee;}
 .stage.pending {opacity:.62;}
 .stage.skip {opacity:.42;}
 .attempts {display:flex; gap:8px; flex-wrap:wrap; margin:0 0 12px;}
@@ -1795,69 +2022,70 @@ CSS = """
 .attempt.pass strong {color:#18794e;}
 .attempt.fail strong {color:#b54735;}
 
-/* Setup and workspace */
-#run-setup {background:#ffffff; border:1px solid #e3e3e3; border-radius:16px; padding:14px !important; margin-top:8px; box-shadow:0 8px 24px rgba(0,0,0,.025);}
-#run-setup h3 {font-size:16px !important; margin:0 0 4px !important; background:transparent !important;}
-#run-setup .prose {background:transparent !important;}
-#run-setup [data-testid="block-info"] {background:transparent !important; color:#242424 !important; padding:0 !important; border-radius:0 !important;}
-#run-input-layout {gap:14px !important; align-items:stretch !important;}
-.run-input-panel, .run-preview-panel {min-width:0 !important; padding:13px !important; border:1px solid #e6e6e6 !important; border-radius:13px !important; background:#ffffff !important;}
-.run-input-panel .label-wrap, .run-preview-panel .label-wrap {background:transparent !important; color:#242424 !important; font-weight:650 !important; padding-left:0 !important;}
-#raster-upload {min-height:128px !important; max-height:148px !important; overflow:hidden !important; border:1px dashed #bdbdbd !important; border-radius:11px !important;}
-#raster-upload .wrap, #raster-upload .container {min-height:112px !important; padding:10px !important;}
-.upload-help .prose, .preview-note .prose {font-size:11px !important; color:#777777 !important; margin-top:-4px !important;}
-#raster-preview {min-height:390px !important; height:390px !important; border-radius:11px !important; overflow:hidden !important; background:#f1f1f1 !important;}
-#raster-preview img {object-fit:contain !important; max-height:390px !important;}
-#example-picker, #model-connection {border:1px solid #dedede !important; border-radius:11px !important; background:#fafafa !important;}
-#example-picker > button, #model-connection > button {font-weight:700 !important; color:#242424 !important;}
-#custom-upload-accordion {border:1px solid #cfcfcf !important; background:#fafafa !important; border-radius:11px !important;}
-#custom-upload-accordion button,
-#custom-upload-accordion .label-wrap {font-weight:700 !important; color:#252525 !important;}
-#run-rsmem-button {margin-top:4px;}
-#run-rsmem-button button, #run-rsmem-button {font-weight:750 !important; min-height:44px !important;}
-#rsmem-workspace {align-items:stretch !important; gap:12px !important; margin-top:8px;}
-.workspace-panel {background:#ffffff !important; border:1px solid #e3e3e3 !important; border-radius:16px !important; padding:0 !important; overflow:hidden !important; box-shadow:0 8px 24px rgba(0,0,0,.025); min-width:0 !important;}
-.workspace-heading {padding:13px 14px 10px !important; margin:0 !important; border-bottom:1px solid #eeeeee;}
-.workspace-heading h3 {font-size:14px !important; margin:0 0 3px !important;}
-.workspace-heading p {font-size:11px !important; color:#777777 !important; margin:0 !important;}
-.workspace-content {padding:12px 14px !important;}
-.workspace-panel .label-wrap {font-size:12px !important;}
-.workspace-panel table {font-size:11px !important;}
-.workspace-panel .prose {font-size:12px !important; line-height:1.55 !important;}
-#task-result-panel {flex:0.9 1 0 !important;}
-#execution-panel {flex:1.2 1 0 !important;}
-#evidence-panel {flex:0.9 1 0 !important;}
-#current-result {border-left:3px solid #262626 !important; background:#f3f3f3 !important; border-radius:0 10px 10px 0 !important; padding:10px 12px !important;}
-#current-result h3 {font-size:13px !important; margin-top:0 !important;}
-#decision-panel {border-top:1px solid #e5e5e5 !important; margin-top:12px !important; padding-top:12px !important; background:transparent !important;}
-#decision-panel h3 {margin-top:0 !important; color:#242424 !important; font-size:14px !important;}
-#accept-result-button button, #accept-result-button {font-weight:800 !important; background:#202020 !important; color:#ffffff !important;}
-#retry-result-button button, #retry-result-button {font-weight:800 !important; background:#ffffff !important; color:#a53b2a !important; border:1px solid #ddb4ab !important;}
-#evaluation-card {background:#fafafa !important; border:1px solid #e6e6e6 !important; border-radius:11px !important; padding:10px 12px !important;}
-#evaluation-card h3 {font-size:13px !important; margin-top:0 !important;}
-#reflection-panel {background:#ffffff !important; border:1px solid #d7d7d7 !important; border-radius:16px !important; padding:16px !important; margin-top:12px;}
+/* Results: single vertical flow */
+#rsmem-workspace {display:block !important; margin-top:8px;}
+.section-title h2 {font-size:17px !important; font-weight:700 !important; margin:24px 0 2px !important; letter-spacing:-.01em;}
+.section-title p {font-size:12.5px !important; color:#737373 !important; margin:0 0 10px !important;}
+.workspace-content {font-size:13px !important; line-height:1.55 !important;}
+
+/* Agent trace */
+.agent-trace {font-size:13px; line-height:1.55;}
+.agent-trace .attempt-head {font-size:14px; font-weight:700; margin:2px 0 4px;}
+.agent-trace .ctx-line {font-size:12px; color:#737373; margin-bottom:10px;}
+.agent-trace .block-label {font-size:13px; font-weight:650; margin:14px 0 8px;}
+.agent-trace ol.plan {list-style:none; margin:0; padding:0; counter-reset:plan;}
+.agent-trace ol.plan li {counter-increment:plan; display:flex; gap:10px; padding:6px 0; border-bottom:1px dashed #eeeeee; align-items:baseline;}
+.agent-trace ol.plan li:last-child {border-bottom:0;}
+.agent-trace ol.plan li::before {content:counter(plan); flex:none; width:20px; height:20px; border-radius:50%; background:#ededed; color:#555555; font-size:11px; display:inline-flex; align-items:center; justify-content:center; position:relative; top:3px;}
+.agent-trace ol.plan code {font-family:ui-monospace,Menlo,monospace; font-size:12px; background:#f0f0f0; border-radius:4px; padding:1px 6px; white-space:nowrap;}
+.agent-trace ol.plan .why {color:#737373;}
+.agent-trace .step-card {border:1px solid #e3e3e3; border-radius:10px; margin-bottom:8px; background:#ffffff; overflow:hidden;}
+.agent-trace .step-card summary {display:flex; align-items:center; gap:10px; padding:8px 12px; cursor:pointer; list-style:none;}
+.agent-trace .step-card summary::-webkit-details-marker {display:none;}
+.agent-trace .step-card .num {flex:none; width:20px; height:20px; border-radius:50%; background:#202020; color:#ffffff; font-size:11px; display:inline-flex; align-items:center; justify-content:center;}
+.agent-trace .step-card code {font-family:ui-monospace,Menlo,monospace; font-size:12.5px;}
+.agent-trace .badge {font-size:11px; font-weight:650; border-radius:999px; padding:2px 9px; margin-left:auto;}
+.agent-trace .badge.ok {color:#18794e; background:#e7f3ec;}
+.agent-trace .badge.err {color:#a53b2a; background:#f7e9e6;}
+.agent-trace .step-obs {border-top:1px solid #f0f0f0; background:#fafafa; padding:9px 12px; font-family:ui-monospace,Menlo,monospace; font-size:11.5px; color:#444444; white-space:pre-wrap; word-break:break-word; line-height:1.5; max-height:220px; overflow:auto;}
+.agent-trace .attempt-answer {border:1px solid #e6e6e6; border-radius:10px; background:#fbfbfb; padding:10px 14px; white-space:pre-wrap;}
+.agent-trace .trace-divider {border:0; border-top:1px solid #e3e3e3; margin:18px 0;}
+
+/* Final answer card */
+#current-result {border:1px solid #e3e3e3 !important; border-left:3px solid #202020 !important; background:#fbfbfb !important; border-radius:0 10px 10px 0 !important; padding:12px 16px !important; margin-top:14px;}
+#current-result h3 {font-size:13px !important; margin:0 0 4px !important;}
+
+/* Evidence */
+#evaluation-card {background:#ffffff !important; border:1px solid #e3e3e3 !important; border-radius:10px !important; padding:12px 14px !important; margin-top:10px;}
+#evaluation-card h3 {font-size:13.5px !important; margin-top:0 !important;}
+
+/* Decision bar */
+#decision-panel {border:1px solid #d4d4d4 !important; border-radius:12px !important; background:#ffffff !important; padding:14px 18px !important; margin-top:16px !important;}
+#decision-panel h3 {margin:0 0 4px !important; color:#242424 !important; font-size:14px !important;}
+#accept-result-button {font-weight:700 !important; background:#202020 !important; color:#ffffff !important;}
+#retry-result-button {font-weight:700 !important; background:#ffffff !important; color:#a53b2a !important; border:1px solid #ddb4ab !important;}
+
+/* Reflection */
+#reflection-panel {background:#ffffff !important; border:1px solid #d7d7d7 !important; border-radius:12px !important; padding:16px 18px !important; margin-top:14px;}
 #reflection-panel h3 {font-size:15px !important; margin-top:0 !important;}
-.workspace-panel .gradio-accordion {border-color:#e5e5e5 !important; border-radius:10px !important; background:#ffffff !important;}
-.workspace-panel .gradio-accordion > button {font-weight:700 !important;}
+
 footer {visibility:hidden; height:0;}
 
-@media (max-width:1100px) {
-  .pipeline {grid-template-columns:repeat(4,minmax(110px,1fr));}
-  #rsmem-workspace {flex-wrap:wrap !important;}
-  #task-result-panel, #execution-panel {flex:1 1 46% !important;}
-  #evidence-panel {flex:1 1 100% !important;}
+@media (max-width:900px) {
+  .pipeline {grid-template-columns:repeat(4,minmax(100px,1fr));}
 }
 @media (max-width:720px) {
-  .gradio-container > .main {padding:0 10px 18px !important;}
+  .gradio-container > .main {padding:0 12px 24px !important;}
   .hero {display:block; text-align:center;}
   .hero p {margin-top:5px !important;}
+  .run-overview {display:block;}
+  .run-overview-flow {justify-content:flex-start; margin-top:10px;}
   .pipeline {grid-template-columns:repeat(2,minmax(0,1fr));}
   .processing-pipeline {grid-template-columns:repeat(2,minmax(0,1fr)) !important;}
-  #run-input-layout {display:block !important;}
-  .run-input-panel {margin-bottom:10px !important;}
-  #raster-preview {height:300px !important; min-height:300px !important;}
-  #rsmem-workspace {display:block !important;}
-  .workspace-panel {margin-bottom:10px !important;}
+  #run-rsmem-button {flex:1 1 100% !important;}
+  #connection-mode .wrap {flex-wrap:wrap !important;}
+  #connection-mode label {flex:1 1 100%;}
+  #connection-mode label + label {border-left:0 !important; border-top:1px solid #d4d4d4 !important;}
 }
 """
 
@@ -1868,84 +2096,54 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
         "<p>Knowledge-enhanced memory evolution for reliable remote sensing agents</p></div>"
     )
 
-    with gr.Tab("Overview"):
-        gr.Markdown(
-            """
-RSMeM combines **Hierarchical Knowledge Grounding (HKG)** with
-**Failure-Aware Experience Refinement (FAR)**. HKG retrieves structured
-geoscience guidance for planning and tool selection. When a case judge or user
-requests another attempt, the Studio compares FTRO, raw full-trajectory, and
-grounded-summary reflections. Only the user's confirmed repair is stored in
-Failure-Aware Memory.
-
-This public Studio combines transparent knowledge retrieval with a required
-OpenAI-compatible LLM planner and a real CPU raster executor. The GPU-backed
-Perception server is intentionally disabled in this free-CPU deployment.
-            """
-        )
-        gr.Image("assets/figure1.png", label="Remote-sensing agent paradigms")
-        gr.Image("assets/figure2.png", label="RSMeM workflow")
-
     with gr.Tab("Run RSMeM"):
-        gr.Markdown(
-            """
-### Run RSMeM on an example or your own data
-
-1. Write your own remote-sensing question and attach GeoTIFFs, or load a prepared example.
-2. Review the task, then enter an OpenAI-compatible API connection.
-3. Run RSMeM and inspect the knowledge, tool calls, outputs, and final answer.
-
-If a bundled result is incorrect, RSMeM will offer repair suggestions before the next attempt.
-For uploaded data, you decide whether to accept the result or try again.
-            """
+        gr.HTML(
+            "<section class='run-overview'>"
+            "<div class='run-overview-copy'><b>Analyze an example or your own remote-sensing data</b>"
+            "<span>RSMeM grounds the task in domain knowledge, executes real CPU raster tools, "
+            "and learns from a confirmed failure before retrying.</span></div>"
+            "<div class='run-overview-flow' aria-label='RSMeM workflow'>"
+            "<span>Retrieve</span><i>→</i><span>Plan</span><i>→</i><span>Execute</span>"
+            "<i>→</i><span>Evaluate</span><i>→</i><span>Reflect</span></div>"
+            "</section>"
         )
         session_state = gr.State({})
-        with gr.Group(elem_id="run-setup"):
-            with gr.Row(elem_id="run-input-layout"):
-                with gr.Column(scale=5, elem_classes=["run-input-panel"]):
+
+        with gr.Group(elem_id="input-card"):
+            gr.Markdown(
+                "### What do you want RSMeM to analyze?\n"
+                "Write your own task and attach GeoTIFFs, or load a prepared case below.",
+                elem_classes=["card-heading"],
+            )
+            query_input = gr.Textbox(
+                label="Your remote-sensing query",
+                value="",
+                placeholder=(
+                    "Describe the analysis task, available raster bands or dates, "
+                    "and the result you want RSMeM to produce."
+                ),
+                lines=5,
+            )
+            with gr.Row(elem_id="attach-row"):
+                with gr.Column(scale=6, min_width=280):
                     gr.Markdown(
-                        "### What do you want RSMeM to analyze?\n"
-                        "Write your own task first. Raster files are optional only when you load a prepared case."
-                    )
-                    query_input = gr.Textbox(
-                        label="Your remote-sensing query",
-                        value="",
-                        placeholder=(
-                            "Describe the analysis task, available raster bands or dates, "
-                            "and the result you want RSMeM to produce."
-                        ),
-                        lines=5,
-                        info="Write this from scratch or load an editable example below.",
+                        "**Attach GeoTIFF files** · `.tif` / `.tiff` · multiple files "
+                        "and multiband rasters supported",
+                        elem_classes=["upload-heading"],
                     )
                     raster_input = gr.File(
-                        label="Attach GeoTIFF files for your own task",
+                        show_label=False,
                         file_count="multiple",
                         file_types=[".tif", ".tiff"],
                         type="filepath",
                         elem_id="raster-upload",
+                        height=170,
                     )
+                with gr.Column(scale=6, min_width=280):
                     gr.Markdown(
-                        "`.tif` and `.tiff` · multiple files and multiband rasters supported",
-                        elem_classes=["upload-help"],
-                    )
-                    with gr.Accordion(
-                        f"Need inspiration? Load one of {len(EXAMPLES) - 1} prepared cases",
-                        open=False,
-                        elem_id="example-picker",
-                    ):
-                        example_input = gr.Dropdown(
-                            label="Prepared remote-sensing case",
-                            choices=[name for name, item in EXAMPLES.items() if item["directory"]],
-                            value=None,
-                            info="This fills the query and loads bundled GeoTIFFs; the query remains editable.",
-                        )
-                        dataset_info = gr.Markdown(
-                            "No example loaded. Choose a case to inspect its data and workflow."
-                        )
-                with gr.Column(scale=7, elem_classes=["run-preview-panel"]):
-                    gr.Markdown(
-                        "### Raster preview\n"
-                        "A lightweight preview of the selected example or your uploaded GeoTIFFs."
+                        "**Preview** · contrast-stretched for display; RSMeM executes "
+                        "on the original values",
+                        elem_classes=["upload-heading"],
                     )
                     raster_preview_output = gr.Image(
                         value=None,
@@ -1953,26 +2151,61 @@ For uploaded data, you decide whether to accept the result or try again.
                         interactive=False,
                         show_label=False,
                         elem_id="raster-preview",
+                        height=200,
                     )
-                    gr.Markdown(
-                        "Input previews are contrast-stretched for display; RSMeM executes on the original values.",
-                        elem_classes=["preview-note"],
-                    )
-            example_input.change(
-                load_example,
-                inputs=[example_input],
-                outputs=[query_input, dataset_info, raster_preview_output],
-            )
-            raster_input.change(
-                preview_uploaded_rasters,
-                inputs=[raster_input],
-                outputs=[raster_preview_output],
-            )
             with gr.Accordion(
-                "Model connection — required to run",
+                f"Need inspiration? Load one of {len(EXAMPLES) - 1} prepared cases",
                 open=False,
-                elem_id="model-connection",
+                elem_id="example-picker",
             ):
+                example_input = gr.Dropdown(
+                    label="Prepared remote-sensing case",
+                    choices=[name for name, item in EXAMPLES.items() if item["directory"]],
+                    value=None,
+                    info="This fills the query and loads bundled GeoTIFFs; the query remains editable.",
+                )
+                dataset_info = gr.Markdown(
+                    "No example loaded. Choose a case to inspect its data and workflow."
+                )
+        example_input.change(
+            load_example,
+            inputs=[example_input],
+            outputs=[query_input, dataset_info, raster_preview_output],
+        )
+        raster_input.change(
+            preview_uploaded_rasters,
+            inputs=[raster_input],
+            outputs=[raster_preview_output],
+        )
+
+        with gr.Group(elem_id="model-service"):
+            gr.Markdown(
+                "### Model service — required to run\n"
+                "Choose how RSMeM calls the planner model. Credentials live in this "
+                "browser session only and are never stored by the Studio.",
+                elem_classes=["card-heading"],
+            )
+            connection_mode = gr.Radio(
+                choices=[MODE_MODELSCOPE, MODE_OPENAI],
+                value=MODE_MODELSCOPE,
+                show_label=False,
+                elem_id="connection-mode",
+            )
+            with gr.Group(visible=True, elem_id="ms-pane") as ms_pane:
+                ms_status = gr.HTML()
+                with gr.Row():
+                    refresh_ms_button = gr.Button(
+                        "Refresh sign-in status", size="sm", elem_id="ms-refresh"
+                    )
+                    signout_button = gr.Button(
+                        "Sign out", size="sm", visible=False, elem_id="ms-signout"
+                    )
+                ms_model_input = gr.Textbox(
+                    label="ModelScope model",
+                    value=MODELSCOPE_DEFAULT_MODEL,
+                    info="API-Inference model identifier; editable.",
+                )
+            with gr.Group(visible=False, elem_id="oa-pane") as oa_pane:
                 with gr.Row():
                     base_url_input = gr.Textbox(
                         label="OpenAI-compatible Base URL",
@@ -1992,32 +2225,47 @@ For uploaded data, you decide whether to accept the result or try again.
                     placeholder="Enter your key for this request",
                     info="Used for this run only and never saved by the Studio.",
                 )
+
+        with gr.Row(elem_id="run-row"):
             run_button = gr.Button(
                 "Analyze with RSMeM", variant="primary", elem_id="run-rsmem-button"
             )
 
         api_status = gr.Markdown(
-            "⚪ Ready. No attempt runs without a valid API key.",
+            "⚪ Ready. Sign in with ModelScope or enter an API key — nothing runs "
+            "without your own model authorization.",
             elem_id="workflow-status",
         )
         timeline_output = gr.HTML(elem_id="workflow-timeline")
 
-        with gr.Row(visible=False, elem_id="rsmem-workspace") as workspace_group:
-            with gr.Column(
-                elem_id="task-result-panel", elem_classes=["workspace-panel"]
-            ):
-                gr.Markdown(
-                    "### Task & decision\nThe task, conclusion, and action that needs your attention.",
-                    elem_classes=["workspace-heading"],
+        with gr.Column(visible=False, elem_id="rsmem-workspace") as workspace_group:
+            gr.Markdown(
+                "## Agent trace\nThe plan, real MCP tool calls, and evidence-grounded answer.",
+                elem_classes=["section-title"],
+            )
+            attempts_output = gr.HTML(elem_id="agent-trace-body")
+            final_output = gr.Markdown(
+                "Run an example or upload your own rasters to see the result.",
+                elem_id="current-result",
+                elem_classes=["workspace-content"],
+            )
+
+            gr.Markdown(
+                "## Evidence & artifacts\nKnowledge, evaluation, and generated files.",
+                elem_classes=["section-title"],
+            )
+            with gr.Accordion("Retrieved knowledge", open=True) as hkg_accordion:
+                hkg_output = gr.Markdown(elem_classes=["workspace-content"])
+            evaluation_output = gr.Markdown(elem_id="evaluation-card")
+            with gr.Accordion("Generated files", open=True):
+                artifact_output = gr.File(
+                    label="Download derived GeoTIFF artifacts", file_count="multiple"
                 )
-                final_output = gr.Markdown(
-                    "Run an example or upload your own rasters to see the result.",
-                    elem_id="current-result",
-                    elem_classes=["workspace-content"],
-                )
-                with gr.Group(visible=False, elem_id="decision-panel") as decision_group:
-                    gr.Markdown("### Review and confirm the result")
-                    decision_output = gr.Markdown()
+
+            with gr.Group(visible=False, elem_id="decision-panel") as decision_group:
+                gr.Markdown("### Review and confirm the result")
+                decision_output = gr.Markdown()
+                with gr.Row():
                     accept_button = gr.Button(
                         "✓ Accept result and finish",
                         variant="primary",
@@ -2026,32 +2274,6 @@ For uploaded data, you decide whether to accept the result or try again.
                     reflect_button = gr.Button(
                         "↻ Incorrect — reflect and retry",
                         elem_id="retry-result-button",
-                    )
-
-            with gr.Column(
-                elem_id="execution-panel", elem_classes=["workspace-panel"]
-            ):
-                gr.Markdown(
-                    "### Memory-evolution trace\nThe plan, real tool calls, and evidence-grounded answer.",
-                    elem_classes=["workspace-heading"],
-                )
-                with gr.Accordion("Inspect the complete attempt", open=True):
-                    attempts_output = gr.Markdown(elem_classes=["workspace-content"])
-
-            with gr.Column(
-                elem_id="evidence-panel", elem_classes=["workspace-panel"]
-            ):
-                gr.Markdown(
-                    "### Evidence & artifacts\nKnowledge, evaluation, and generated files.",
-                    elem_classes=["workspace-heading"],
-                )
-                with gr.Accordion("Retrieved knowledge", open=True) as hkg_accordion:
-                    hkg_output = gr.Markdown(elem_classes=["workspace-content"])
-                gr.Markdown("#### Automated evaluation")
-                evaluation_output = gr.Markdown(elem_id="evaluation-card")
-                with gr.Accordion("Generated files", open=True):
-                    artifact_output = gr.File(
-                        label="Download derived GeoTIFF artifacts", file_count="multiple"
                     )
 
         with gr.Group(
@@ -2110,12 +2332,24 @@ For uploaded data, you decide whether to accept the result or try again.
             artifact_output,
             workspace_group,
         ]
+        connection_mode.change(
+            switch_connection_mode,
+            inputs=[connection_mode],
+            outputs=[ms_pane, oa_pane, api_key_input],
+        )
+        refresh_ms_button.click(
+            refresh_ms_session, outputs=[ms_status, signout_button]
+        )
+        signout_button.click(sign_out_ms, outputs=[ms_status, signout_button])
+        demo.load(refresh_ms_session, outputs=[ms_status, signout_button])
         run_button.click(
-            start_interactive_workflow_stream,
+            start_workflow_ui,
             inputs=[
                 query_input,
                 example_input,
                 raster_input,
+                connection_mode,
+                ms_model_input,
                 base_url_input,
                 model_input,
                 api_key_input,
@@ -2129,8 +2363,15 @@ For uploaded data, you decide whether to accept the result or try again.
             outputs=workflow_outputs,
         )
         reflect_button.click(
-            request_custom_reflections,
-            inputs=[session_state, api_key_input],
+            request_custom_reflections_ui,
+            inputs=[
+                session_state,
+                connection_mode,
+                ms_model_input,
+                base_url_input,
+                model_input,
+                api_key_input,
+            ],
             outputs=workflow_outputs,
         )
         candidate_choice.change(
@@ -2149,13 +2390,17 @@ For uploaded data, you decide whether to accept the result or try again.
             outputs=[edited_reflection],
         )
         retry_button.click(
-            confirm_reflection_and_retry,
+            confirm_reflection_and_retry_ui,
             inputs=[
                 session_state,
                 candidate_choice,
                 edited_reflection,
                 user_diagnosis,
                 user_plan,
+                connection_mode,
+                ms_model_input,
+                base_url_input,
+                model_input,
                 api_key_input,
             ],
             outputs=workflow_outputs,
@@ -2195,6 +2440,15 @@ If RSMeM supports your research, please cite the arXiv paper:
 [DOI](https://doi.org/10.48550/arXiv.2607.24772)
             """
         )
+        with gr.Accordion("Method overview and paper figures", open=False, elem_id="method-overview"):
+            gr.Markdown(
+                "RSMeM combines **Hierarchical Knowledge Grounding (HKG)** with "
+                "**Failure-Aware Experience Refinement (FAR)**. HKG supplies structured "
+                "geoscience guidance before tool use; FAR turns a confirmed failed trajectory "
+                "into reusable memory for the next attempt."
+            )
+            gr.Image("assets/figure1.png", label="Remote-sensing agent paradigms")
+            gr.Image("assets/figure2.png", label="RSMeM workflow")
 
     with gr.Tab("Challenge submission"):
         learn_submission = (
@@ -2225,5 +2479,133 @@ CPU demonstration results.
         )
 
 
+def _oauth_page(title: str, body: str) -> str:
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<title>RSMeM · ModelScope sign-in</title><style>"
+        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+        "background:#f7f7f7;color:#242424;display:flex;align-items:center;"
+        "justify-content:center;min-height:90vh;margin:0}"
+        ".card{background:#fff;border:1px solid #e3e3e3;border-radius:14px;"
+        "padding:28px 32px;max-width:460px;line-height:1.6}"
+        "h1{font-size:18px;margin:0 0 8px}p{font-size:14px;color:#555;margin:6px 0}"
+        "</style></head><body><div class='card'>"
+        f"<h1>{title}</h1>{body}</div></body></html>"
+    )
+
+
+def _request_redirect_uri(headers) -> str:
+    return msoauth.resolve_redirect_uri(
+        headers.get("x-forwarded-host"), headers.get("host")
+    )
+
+
+def create_app():
+    """Wrap the Gradio app in FastAPI so the OAuth routes share the origin."""
+    fastapi_app = FastAPI()
+
+    @fastapi_app.middleware("http")
+    async def ensure_session_cookie(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path == "/" and not request.cookies.get(msoauth.SESSION_COOKIE):
+            session_id = secrets.token_urlsafe(24)
+            proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+            if proto == "https":
+                # Partitioned keeps the cookie working inside the modelscope.cn
+                # iframe under third-party-cookie blocking (CHIPS).
+                attributes = (
+                    "; HttpOnly; Path=/; Max-Age=604800; SameSite=None; Secure; Partitioned"
+                )
+            else:
+                attributes = "; HttpOnly; Path=/; Max-Age=604800; SameSite=Lax"
+            response.headers.append(
+                "set-cookie", f"{msoauth.SESSION_COOKIE}={session_id}{attributes}"
+            )
+        return response
+
+    @fastapi_app.get("/oauth/login")
+    async def oauth_login(request: Request):
+        if not msoauth.oauth_configured():
+            return PlainTextResponse(
+                "ModelScope OAuth is not configured on this deployment.", status_code=503
+            )
+        nonce = request.query_params.get("nonce", "")
+        if not msoauth.SESSION_STORE.nonce_valid(nonce):
+            return HTMLResponse(
+                _oauth_page(
+                    "Sign-in link expired",
+                    "<p>Go back to the RSMeM tab, press <b>Refresh sign-in status</b>, "
+                    "and use the new sign-in button.</p>",
+                ),
+                status_code=400,
+            )
+        try:
+            redirect_uri = _request_redirect_uri(request.headers)
+        except ValueError:
+            return PlainTextResponse("Cannot determine the callback host.", status_code=500)
+        return RedirectResponse(
+            msoauth.build_authorize_url(msoauth.oauth_client_id(), redirect_uri, nonce)
+        )
+
+    @fastapi_app.get("/oauth/callback")
+    async def oauth_callback(request: Request):
+        params = request.query_params
+        if params.get("error"):
+            return HTMLResponse(
+                _oauth_page(
+                    "Sign-in was not completed",
+                    "<p>The authorization was cancelled or rejected. You can close "
+                    "this tab and try again from the RSMeM page.</p>",
+                ),
+                status_code=400,
+            )
+        code = params.get("code", "")
+        state = params.get("state", "")
+        session_id = msoauth.SESSION_STORE.consume_nonce(state)
+        if not code or not session_id:
+            return HTMLResponse(
+                _oauth_page(
+                    "Sign-in link expired",
+                    "<p>Go back to the RSMeM tab, press <b>Refresh sign-in status</b>, "
+                    "and use the new sign-in button.</p>",
+                ),
+                status_code=400,
+            )
+        try:
+            redirect_uri = _request_redirect_uri(request.headers)
+            payload = msoauth.exchange_code(
+                code, msoauth.oauth_client_id(), msoauth.oauth_client_secret(), redirect_uri
+            )
+        except ValueError as exc:
+            return HTMLResponse(
+                _oauth_page("Sign-in failed", f"<p>{html_lib.escape(str(exc))}</p>"),
+                status_code=502,
+            )
+        userinfo = msoauth.fetch_userinfo(payload["access_token"])
+        msoauth.SESSION_STORE.store_token(session_id, payload, userinfo)
+        user = html_lib.escape(msoauth.display_name(userinfo))
+        return HTMLResponse(
+            _oauth_page(
+                "✅ Connected to ModelScope",
+                f"<p>Signed in as <b>{user}</b>. RSMeM will now use your own "
+                "API-Inference quota for this browser session.</p>"
+                "<p>Return to the RSMeM tab, press <b>Refresh sign-in status</b>, "
+                "and close this tab.</p>",
+            )
+        )
+
+    demo.queue()
+    gr.mount_gradio_app(
+        fastapi_app, demo, path="/", theme=gr.themes.Soft(), css=CSS
+    )
+    return fastapi_app
+
+
 if __name__ == "__main__":
-    demo.launch(theme=gr.themes.Soft(), css=CSS)
+    import uvicorn
+
+    uvicorn.run(
+        create_app(),
+        host=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
+        port=int(os.getenv("GRADIO_SERVER_PORT", os.getenv("PORT", "7860"))),
+    )

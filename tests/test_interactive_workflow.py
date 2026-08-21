@@ -161,7 +161,7 @@ class InteractiveWorkflowTests(unittest.TestCase):
         self.assertIn("You make the final decision", summary)
         self.assertIn("lacks evidence", summary)
 
-    def test_execution_markdown_does_not_duplicate_evaluation(self):
+    def test_execution_trace_renders_step_cards_without_evaluation(self):
         state = {
             "attempts": [{
                 "attempt": 1,
@@ -169,15 +169,18 @@ class InteractiveWorkflowTests(unittest.TestCase):
                 "tool_plan": [{"tool": "inspect_rasters", "purpose": "Inspect input"}],
                 "trajectory": [{
                     "step": 1, "tool": "inspect_rasters", "status": "success",
-                    "observation": "one readable raster",
+                    "observation": "one readable raster & <script>alert(1)</script>",
                 }],
                 "answer": "The raster is readable.",
                 "evaluation": {"verdict": "pass_supported", "confidence": 0.95},
             }],
         }
-        rendered = app._attempts_interactive_markdown(state)
+        rendered = app._attempts_interactive_html(state)
         self.assertIn("Planned tool chain", rendered)
         self.assertIn("Answer synthesized from tool evidence", rendered)
+        self.assertIn('class="badge ok"', rendered)
+        self.assertIn("&lt;script&gt;", rendered)
+        self.assertNotIn("<script>alert(1)</script>", rendered)
         self.assertNotIn("#### Evaluation", rendered)
         self.assertNotIn("PASS_SUPPORTED", rendered)
 
@@ -392,6 +395,49 @@ class InteractiveWorkflowTests(unittest.TestCase):
                     state, "FTRO", chosen, "", "", "private-test-key"
                 )
         self.assertEqual(json.dumps(state, sort_keys=True), original)
+
+
+def test_run_tab_is_primary_and_overview_content_is_progressively_disclosed():
+    config = app.demo.get_config_file()
+    tab_labels = [
+        component.get("props", {}).get("label")
+        for component in config["components"]
+        if component.get("type") == "tabitem"
+    ]
+    assert tab_labels == ["Run RSMeM", "Open-source resources", "Challenge submission"]
+    assert "Overview" not in tab_labels
+
+    html_values = [
+        str(component.get("props", {}).get("value", ""))
+        for component in config["components"]
+        if component.get("type") == "html"
+    ]
+    assert any(
+        "Retrieve" in value and "Evaluate" in value and "Reflect" in value
+        for value in html_values
+    )
+    assert any(
+        component.get("props", {}).get("label") == "Method overview and paper figures"
+        for component in config["components"]
+    )
+
+
+def test_results_flow_is_single_column_with_agent_trace_before_evidence():
+    config = app.demo.get_config_file()
+    markdown_values = [
+        str(component.get("props", {}).get("value", ""))
+        for component in config["components"]
+        if component.get("type") == "markdown"
+    ]
+    trace_index = next(
+        i for i, value in enumerate(markdown_values) if value.startswith("## Agent trace")
+    )
+    evidence_index = next(
+        i for i, value in enumerate(markdown_values) if value.startswith("## Evidence")
+    )
+    assert trace_index < evidence_index
+    assert not any("Task & decision" in value for value in markdown_values)
+    assert not any("Memory-evolution trace" in value for value in markdown_values)
 
 
 if __name__ == "__main__":
