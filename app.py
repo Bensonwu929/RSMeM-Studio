@@ -1934,6 +1934,10 @@ CSS = """
   --body-text-color-subdued: #737373;
   --input-background-fill: #ffffff;
   --input-border-color: #dddddd;
+  --block-title-background-fill: transparent;
+  --block-label-background-fill: transparent;
+  --block-title-text-color: #242424;
+  --block-label-text-color: #555555;
   --button-primary-background-fill: #202020;
   --button-primary-background-fill-hover: #333333;
   --button-primary-text-color: #ffffff;
@@ -1961,6 +1965,8 @@ CSS = """
 
 /* Cards: input + model service */
 #input-card, #model-service {background:#ffffff !important; border:1px solid #e3e3e3 !important; border-radius:14px !important; padding:18px 20px !important; margin-top:14px;}
+#input-card .form, #model-service .form, #input-card .styler, #model-service .styler {background:transparent !important; border:none !important; box-shadow:none !important;}
+.card-heading, .upload-heading, .section-title {background:transparent !important; border:none !important; box-shadow:none !important; padding:0 !important;}
 .card-heading h3 {font-size:15px !important; margin:0 0 2px !important;}
 .card-heading p {font-size:12.5px !important; color:#737373 !important; margin:0 0 10px !important;}
 #attach-row {gap:14px !important; margin-top:4px;}
@@ -1974,10 +1980,12 @@ CSS = """
 
 /* Connection mode segmented control */
 #connection-mode {border:0 !important; background:transparent !important; padding:0 !important;}
-#connection-mode .wrap {display:flex !important; gap:0 !important; border:1px solid #d4d4d4; border-radius:10px; overflow:hidden; flex-wrap:nowrap !important;}
+#connection-mode .wrap {display:flex !important; gap:0 !important; border:1px solid #d4d4d4; border-radius:10px; overflow:hidden; flex-wrap:nowrap !important; background:transparent;}
 #connection-mode label {flex:1 1 50%; margin:0 !important; border-radius:0 !important; padding:11px 16px !important; background:#fafafa !important; border:0 !important; font-weight:600; justify-content:center;}
+#connection-mode label, #connection-mode label span {color:#242424 !important;}
 #connection-mode label + label {border-left:1px solid #d4d4d4 !important;}
-#connection-mode label.selected, #connection-mode label:has(input:checked) {background:#ffffff !important; box-shadow:inset 0 -2px 0 #202020 !important;}
+#connection-mode label.selected, #connection-mode label:has(input:checked) {background:#ffffff !important; box-shadow:inset 0 -3px 0 #202020 !important;}
+#connection-mode label.selected span, #connection-mode label:has(input:checked) span {color:#242424 !important; font-weight:700;}
 #connection-mode input[type=radio] {position:absolute; opacity:0; pointer-events:none;}
 #ms-pane, #oa-pane {border:0 !important; box-shadow:none !important; background:transparent !important; padding:0 !important; margin-top:12px;}
 .auth-box {border-left:3px solid #d4d4d4; background:#fafafa; border-radius:0 8px 8px 0; padding:12px 16px;}
@@ -2191,7 +2199,7 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
                 show_label=False,
                 elem_id="connection-mode",
             )
-            with gr.Group(visible=True, elem_id="ms-pane") as ms_pane:
+            with gr.Column(visible=True, elem_id="ms-pane") as ms_pane:
                 ms_status = gr.HTML()
                 with gr.Row():
                     refresh_ms_button = gr.Button(
@@ -2205,7 +2213,7 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
                     value=MODELSCOPE_DEFAULT_MODEL,
                     info="API-Inference model identifier; editable.",
                 )
-            with gr.Group(visible=False, elem_id="oa-pane") as oa_pane:
+            with gr.Column(visible=False, elem_id="oa-pane") as oa_pane:
                 with gr.Row():
                     base_url_input = gr.Textbox(
                         label="OpenAI-compatible Base URL",
