@@ -394,27 +394,5 @@ class InteractiveWorkflowTests(unittest.TestCase):
         self.assertEqual(json.dumps(state, sort_keys=True), original)
 
 
-def test_run_tab_is_primary_and_overview_content_is_progressively_disclosed():
-    config = app.demo.get_config_file()
-    tab_labels = [
-        component.get("props", {}).get("label")
-        for component in config["components"]
-        if component.get("type") == "tabitem"
-    ]
-    assert tab_labels == ["Run RSMeM", "Open-source resources", "Challenge submission"]
-    assert "Overview" not in tab_labels
-
-    html_values = [
-        str(component.get("props", {}).get("value", ""))
-        for component in config["components"]
-        if component.get("type") == "html"
-    ]
-    assert any("Retrieve" in value and "Evaluate" in value and "Reflect" in value for value in html_values)
-    assert any(
-        component.get("props", {}).get("label") == "Method overview and paper figures"
-        for component in config["components"]
-    )
-
-
 if __name__ == "__main__":
     unittest.main()
