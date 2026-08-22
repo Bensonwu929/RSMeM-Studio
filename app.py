@@ -1283,6 +1283,14 @@ def _execute_interactive_attempt_steps(state: dict, api_key: str):
         ),
         executor_success=executor_success,
         executor_reasons=executor_reasons,
+        observations=[
+            {
+                "tool": step["tool"],
+                "status": step["status"],
+                "observation": str(step["observation"])[:600],
+            }
+            for step in trajectory
+        ],
     )
     yield "answer", "Synthesizing the answer from verified tool observations."
     answer = synthesize_answer(

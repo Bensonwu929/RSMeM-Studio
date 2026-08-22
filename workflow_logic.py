@@ -82,7 +82,7 @@ Return exactly:
 {{"verdict":"correct|incorrect|uncertain","confidence":0.0,
 "candidate_interpretation":"...","reference_interpretation":"...",
 "comparison":"...","reason_codes":["..."],"evidence_step_ids":[1]}}"""
-    value = _call_json(api_call, api_key, base_url, model, system, user, "verdict", 900)
+    value = _call_json(api_call, api_key, base_url, model, system, user, "verdict", 16384)
     verdict = str(value.get("verdict", "")).lower()
     if verdict not in CASE_VERDICTS:
         raise ValueError(f"Invalid case-judge verdict: {verdict}")
@@ -117,7 +117,7 @@ Return exactly:
 "calculation_consistent":true,"answer_supported":true}},"reason_codes":["..."],
 "first_decisive_error_step":null,"root_cause":null,
 "evidence":[{{"step":1,"observation":"..."}}],"correction_guidance":null,"missing_information":[]}}"""
-    value = _call_json(api_call, api_key, base_url, model, system, user, "verdict", 1200)
+    value = _call_json(api_call, api_key, base_url, model, system, user, "verdict", 16384)
     verdict = str(value.get("verdict", "")).lower()
     retry = value.get("retry")
     if verdict not in GATE_VERDICTS or not isinstance(retry, bool):
@@ -145,9 +145,12 @@ insufficient or execution failed, say exactly what remains unsupported. Be conci
     user = f"""Task: {query}
 Executor status: {execution_result}
 Real tool trajectory: {json.dumps(trajectory, ensure_ascii=False)}"""
-    answer = api_call(api_key, base_url, model, system, user, 700).strip()
+    answer = api_call(api_key, base_url, model, system, user, 16384).strip()
     if not answer:
-        raise ValueError("Answer synthesizer returned an empty response.")
+        raise ValueError(
+            "Answer synthesizer returned an empty response — reasoning models can "
+            "exhaust the token budget on hidden thinking; try again or pick another model."
+        )
     return answer
 
 
@@ -178,7 +181,7 @@ Return exactly:
 "attempted_strategy":[{{"text":"...","source_step_ids":[1]}}],
 "verified_state":[{{"text":"...","source_step_ids":[1]}}],
 "observed_failures":[],"unfinished_subgoals":[],"budget_signals":[]}}"""
-    value = _call_json(api_call, api_key, base_url, model, system, user, "task_summary", 1100)
+    value = _call_json(api_call, api_key, base_url, model, system, user, "task_summary", 16384)
     step_count = len(full_view["trajectory"])
     claims = [value.get("task_summary")]
     for field in ("attempted_strategy", "verified_state", "observed_failures", "unfinished_subgoals", "budget_signals"):
@@ -211,7 +214,7 @@ Evidence: {json.dumps(evidence, ensure_ascii=False)}
 
 In 3-5 sentences identify the earliest decisive failure, verified work to keep, minimal next actions,
 and stopping condition. Return exactly {{"reflective_text":"..."}}."""
-    value = _call_json(api_call, api_key, base_url, model, system, user, "reflective_text", 700)
+    value = _call_json(api_call, api_key, base_url, model, system, user, "reflective_text", 16384)
     text = str(value.get("reflective_text", "")).strip()
     if len(text) < 20:
         raise ValueError("Reflection is too short to be actionable.")
