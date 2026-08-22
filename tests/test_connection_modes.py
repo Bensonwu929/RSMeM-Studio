@@ -157,6 +157,62 @@ class SessionStatusTests(unittest.TestCase):
         self.assertEqual(same_id, session_id)
 
 
+class DebugTraceTests(unittest.TestCase):
+    def test_trace_file_contains_stage_events_and_no_key_material(self):
+        import tempfile as tf
+
+        with tf.TemporaryDirectory() as run_dir:
+            state = {
+                "run_dir": run_dir,
+                "mode": "custom",
+                "query": "inspect",
+                "model": "m1",
+                "base_url": "https://example.com/v1",
+                "attempts": [],
+            }
+            app._trace_event(state, "plan", "Planner returned 1 step(s): inspect_rasters")
+            app._trace_event(
+                state, "execute", "Stage failed: boom",
+                error="boom", traceback="Traceback ...",
+            )
+            path = app._write_debug_trace(state)
+            self.assertTrue(path and path.endswith("rsmem_debug_trace.json"))
+            payload = open(path, encoding="utf-8").read()
+            self.assertIn("Planner returned", payload)
+            self.assertIn("Traceback", payload)
+            self.assertNotIn("api_key", payload)
+
+    def test_stream_error_names_the_failing_stage(self):
+        events = []
+
+        def exploding_steps(state, api_key):
+            yield "plan", "Planning an evidence-grounded tool chain with the selected model."
+            raise TypeError("'NoneType' object is not subscriptable")
+
+        state = {"run_dir": "", "attempts": []}
+        with patch.object(app, "_initialize_interactive_workflow", return_value=(state, "k")), \
+             patch.object(app, "_execute_interactive_attempt_steps", exploding_steps):
+            stream = app.start_interactive_workflow_stream("q", "", [], "", "", "k")
+            outputs = next(stream)
+            self.assertEqual(len(outputs), 21)
+            with self.assertRaises(Exception) as ctx:
+                for outputs in stream:
+                    pass
+        self.assertIn("tool-chain planning", str(ctx.exception))
+        self.assertTrue(any(e.get("traceback") for e in state["debug_trace"]))
+
+    def test_attempt_error_is_stage_tagged_for_non_stream_paths(self):
+        def exploding_steps(state, api_key):
+            yield "evaluate", "Comparing the result with the case reference."
+            raise TypeError("'NoneType' object is not subscriptable")
+
+        state = {"run_dir": "", "attempts": []}
+        with patch.object(app, "_execute_interactive_attempt_steps", exploding_steps):
+            with self.assertRaises(RuntimeError) as ctx:
+                app._execute_interactive_attempt(state, "k")
+        self.assertIn("evaluation", str(ctx.exception))
+
+
 class OAuthRouteTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -118,7 +118,7 @@ class InteractiveWorkflowTests(unittest.TestCase):
             ))
         self.assertEqual(len(updates), 5)
         for update in updates:
-            self.assertEqual(len(update), 20)
+            self.assertEqual(len(update), 21)
         progress_html = "\n".join(str(update[2]) for update in updates[:-1])
         for label in ("Plan", "Execute", "Answer", "Evaluate"):
             self.assertIn(label, progress_html)

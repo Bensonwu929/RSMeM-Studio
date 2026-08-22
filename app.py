@@ -12,6 +12,8 @@ import re
 import secrets
 import socket
 import tempfile
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -82,11 +84,18 @@ PROJECT_ABSTRACT = (
 )
 GITHUB_URL = "https://github.com/AI9Stars/RSMeM"
 LEARN_URL = "https://modelscope.cn/learn/435887"
-DEFAULT_BASE_URL = "https://uni-api.cstcloud.cn/v1"
-DEFAULT_MODEL = "deepseek-v4-flash-aistar"
+DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEFAULT_MODEL = "deepseek-v4-flash"
 MODE_MODELSCOPE = "ModelScope quota"
 MODE_OPENAI = "OpenAI-compatible API"
-MODELSCOPE_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+MODELSCOPE_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Pro-0813"
+MODELSCOPE_MODEL_CHOICES = [
+    "deepseek-ai/DeepSeek-V4-Pro-0813",
+    "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "moonshotai/Kimi-K3",
+    "ZhipuAI/GLM-5.2",
+    "Qwen/Qwen3.8-27B",
+]
 STUDIO_DIRECT_URL = "https://wbx929-rsmem.ms.show"
 
 EXAMPLES = {
@@ -1222,14 +1231,26 @@ def _reflection_trace(attempt: dict) -> list[dict]:
 def _execute_interactive_attempt_steps(state: dict, api_key: str):
     attempt_number = len(state["attempts"]) + 1
     memory = state["memory"][-1]["reflection"] if state["memory"] else ""
-    yield "plan", "Planning an evidence-grounded CPU tool chain with the selected model."
+    yield "plan", "Planning an evidence-grounded tool chain with the selected model."
     plan = plan_toolchain(
         state["query"], state["knowledge_context"], memory,
         api_key, state["base_url"], state["model"],
     )
+    _trace_event(
+        state, "plan",
+        f"Planner returned {len(plan)} step(s): " + ", ".join(step["tool"] for step in plan),
+    )
     yield "execute", f"Executing {len(plan)} planned raster-tool step(s) on the real inputs."
     trajectory, executor_success, executor_reasons, executor_result, artifacts = execute_cpu_tools(
         plan, state["raster_paths"], Path(state["run_dir"]), attempt_number
+    )
+    _trace_event(
+        state, "execute",
+        "Execution finished · " + ", ".join(
+            f"{step['tool']}={step['status']}" for step in trajectory
+        ),
+        executor_success=executor_success,
+        executor_reasons=executor_reasons,
     )
     yield "answer", "Synthesizing the answer from verified tool observations."
     answer = synthesize_answer(
@@ -1277,6 +1298,11 @@ def _execute_interactive_attempt_steps(state: dict, api_key: str):
     )
     state["artifacts"] = sorted(set(state["artifacts"] + artifacts))
     state["candidates"] = {}
+    _trace_event(
+        state, "evaluate",
+        f"Evaluation verdict: {evaluation.get('verdict', 'unknown')} · "
+        f"confidence={evaluation.get('confidence', 'n/a')}",
+    )
 
     if state["mode"] == "case":
         if correct:
@@ -1301,9 +1327,59 @@ def _execute_interactive_attempt_steps(state: dict, api_key: str):
     yield "complete", "The attempt is complete."
 
 
+PHASE_LABELS = {
+    "start": "initialization",
+    "retrieve": "knowledge retrieval",
+    "plan": "tool-chain planning",
+    "execute": "tool execution",
+    "answer": "answer synthesis",
+    "evaluate": "evaluation",
+    "reflect": "reflection generation",
+    "complete": "completion",
+}
+
+
+def _trace_event(state: dict, phase: str, detail: str, **extra) -> None:
+    state.setdefault("debug_trace", []).append(
+        {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "phase": phase,
+            "detail": detail,
+            **extra,
+        }
+    )
+
+
+def _write_debug_trace(state: dict) -> str | None:
+    """Dump the full run state (never credentials — none are stored in it)
+    to a downloadable JSON so users can report exactly where a run failed."""
+    run_dir = state.get("run_dir")
+    if not run_dir or not Path(run_dir).is_dir():
+        return None
+    payload = dict(state)
+    payload["generated_at"] = datetime.now(timezone.utc).isoformat()
+    path = Path(run_dir) / "rsmem_debug_trace.json"
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
 def _execute_interactive_attempt(state: dict, api_key: str) -> dict:
-    for _phase, _detail in _execute_interactive_attempt_steps(state, api_key):
-        pass
+    phase = "start"
+    try:
+        for phase, detail in _execute_interactive_attempt_steps(state, api_key):
+            _trace_event(state, phase, detail)
+    except Exception as exc:
+        _trace_event(
+            state, phase, f"Stage failed: {exc}",
+            error=str(exc), traceback=traceback.format_exc(),
+        )
+        _write_debug_trace(state)
+        raise RuntimeError(
+            f"error during {PHASE_LABELS.get(phase, phase)}: {exc}"
+        ) from exc
     return state
 
 
@@ -1333,7 +1409,25 @@ def _processing_timeline(active_phase: str, detail: str) -> str:
 
 def _stream_update(state: dict, phase: str, detail: str):
     status = f"### RSMeM is working\n\n{detail}"
-    return (state, status, _processing_timeline(phase, detail), *[gr.skip() for _ in range(17)])
+    return (state, status, _processing_timeline(phase, detail), *[gr.skip() for _ in range(18)])
+
+
+def _stream_error_update(state: dict, phase: str, exc: Exception, trace_path: str | None):
+    label = PHASE_LABELS.get(phase, phase)
+    status = (
+        f"### ❌ Attempt failed during {label}\n\n"
+        f"`{exc}`\n\n"
+        "Download the debug trace under **Evidence & artifacts** for the full "
+        "stage-by-stage log and traceback."
+    )
+    return (
+        state,
+        status,
+        gr.skip(),
+        *[gr.skip() for _ in range(16)],
+        gr.update(visible=True),
+        gr.update(value=trace_path),
+    )
 
 
 def _initialize_interactive_workflow(
@@ -1388,7 +1482,18 @@ def _initialize_interactive_workflow(
         "memory": [],
         "candidates": {},
         "artifacts": [],
+        "debug_trace": [],
     }
+    _trace_event(
+        state, "start",
+        f"Run initialized · mode={state['mode']} · model={model} · base_url={base_url} · "
+        f"{len(raster_paths)} raster(s) from {source}.",
+    )
+    _trace_event(
+        state, "retrieve",
+        f"HKG retrieval kept {len(retrieved)} entrie(s) after the low-relevance filter.",
+        scores=[record.get("score") for record in retrieved],
+    )
     return state, api_key
 
 
@@ -1421,14 +1526,25 @@ def start_interactive_workflow_stream(
     state, api_key = _initialize_interactive_workflow(
         query, example_name, uploaded_files, requested_base_url, requested_model, user_api_key
     )
+    phase = "start"
     try:
         for phase, detail in _execute_interactive_attempt_steps(state, api_key):
+            _trace_event(state, phase, detail)
             if phase == "complete":
+                _write_debug_trace(state)
                 yield (state, *_render_interactive_state(state))
             else:
                 yield _stream_update(state, phase, detail)
     except Exception as exc:
-        raise gr.Error(f"Attempt 1 failed: {exc}") from exc
+        _trace_event(
+            state, phase, f"Stage failed: {exc}",
+            error=str(exc), traceback=traceback.format_exc(),
+        )
+        trace_path = _write_debug_trace(state)
+        yield _stream_error_update(state, phase, exc, trace_path)
+        raise gr.Error(
+            f"Attempt 1 failed during {PHASE_LABELS.get(phase, phase)}: {exc}"
+        ) from exc
 
 
 def _esc(value) -> str:
@@ -1666,6 +1782,7 @@ def _render_interactive_state(state: dict):
         final_md,
         state.get("artifacts", []),
         gr.update(visible=bool(state.get("attempts"))),
+        gr.update(value=_write_debug_trace(state)),
     )
 
 
@@ -1693,6 +1810,11 @@ def request_custom_reflections(state: dict, user_api_key: str):
             trajectory=_reflection_trace(latest), ftro_builder=_ftro_candidate_view,
         )
     except Exception as exc:
+        _trace_event(
+            updated, "reflect", f"Reflection generation failed: {exc}",
+            error=str(exc), traceback=traceback.format_exc(),
+        )
+        _write_debug_trace(updated)
         raise gr.Error(f"Reflection generation failed: {exc}") from exc
     updated["status"] = "awaiting_reflection"
     return (updated, *_render_interactive_state(updated))
@@ -2122,9 +2244,10 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
     with gr.Tab("Run RSMeM"):
         gr.HTML(
             "<section class='run-overview'>"
-            "<div class='run-overview-copy'><b>Analyze an example or your own remote-sensing data</b>"
-            "<span>RSMeM grounds the task in domain knowledge, executes real CPU raster tools, "
-            "and learns from a confirmed failure before retrying.</span></div>"
+            "<div class='run-overview-copy'><b>Real analysis on the original pixels — not a chat about screenshots</b>"
+            "<span>RSMeM plans with structured geoscience knowledge, executes 100+ real raster tools "
+            "on your GeoTIFFs, grounds every answer in tool evidence you can audit and download, "
+            "and learns from confirmed failures across attempts.</span></div>"
             "<div class='run-overview-flow' aria-label='RSMeM workflow'>"
             "<span>Retrieve</span><i>→</i><span>Plan</span><i>→</i><span>Execute</span>"
             "<i>→</i><span>Evaluate</span><i>→</i><span>Reflect</span></div>"
@@ -2224,10 +2347,12 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
                     signout_button = gr.Button(
                         "Sign out", size="sm", visible=False, elem_id="ms-signout"
                     )
-                ms_model_input = gr.Textbox(
+                ms_model_input = gr.Dropdown(
                     label="ModelScope model",
+                    choices=MODELSCOPE_MODEL_CHOICES,
                     value=MODELSCOPE_DEFAULT_MODEL,
-                    info="API-Inference model identifier; editable.",
+                    allow_custom_value=True,
+                    info="Pick an API-Inference model or type any model identifier.",
                 )
             with gr.Column(visible=False, elem_id="oa-pane") as oa_pane:
                 with gr.Row():
@@ -2284,6 +2409,16 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
             with gr.Accordion("Generated files", open=True):
                 artifact_output = gr.File(
                     label="Download derived GeoTIFF artifacts", file_count="multiple"
+                )
+            with gr.Accordion("Debug trace", open=False):
+                gr.Markdown(
+                    "Stage-by-stage log of this run — knowledge scores, planned tools, "
+                    "real tool observations, model verdicts, and full tracebacks on "
+                    "errors. Attach it when reporting a problem.",
+                    elem_classes=["upload-heading"],
+                )
+                trace_output = gr.File(
+                    label="Download run trace (JSON)", file_count="single"
                 )
 
             with gr.Group(visible=False, elem_id="decision-panel") as decision_group:
@@ -2355,6 +2490,7 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
             final_output,
             artifact_output,
             workspace_group,
+            trace_output,
         ]
         connection_mode.change(
             switch_connection_mode,
@@ -2458,11 +2594,6 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
 - [Earth-Bench example-data source](https://huggingface.co/datasets/Sssunset/Earth-Bench) (Apache-2.0)
 - Knowledge base included in this Studio: 3 domains, 12 subdomains, and 64 atomic tasks
 - Code license: MIT · bundled example-data license: Apache-2.0
-
-The Studio starts four released CPU services—Analysis, Index, Inversion, and
-Statistics—as independent stdio MCP processes. The planner is constrained by
-their live `list_tools` responses and execution uses MCP `call_tool`. GPU-backed
-Perception remains explicitly disabled on this free CPU deployment.
 
 ### Cite the paper
 
