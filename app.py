@@ -2090,11 +2090,10 @@ CSS = """
 .hero h1 {font-size:24px !important; line-height:1.2 !important; margin:0 !important; letter-spacing:-.02em;}
 .hero p {margin:0 !important; color:#737373; font-size:13px;}
 .note {border-left:3px solid #262626; padding:.75rem 1rem; background:#f1f1f1;}
-.run-overview {display:flex; align-items:center; justify-content:space-between; gap:18px; padding:13px 15px; margin:2px 0 10px; border:1px solid #e3e3e3; border-radius:14px; background:#ffffff;}
-.run-overview-copy {min-width:230px;}
+.run-overview {display:block; padding:13px 15px; margin:2px 0 10px; border:1px solid #e3e3e3; border-radius:14px; background:#ffffff;}
 .run-overview-copy b {display:block; font-size:14px; line-height:1.35; color:#242424;}
 .run-overview-copy span {display:block; margin-top:3px; font-size:11px; line-height:1.45; color:#737373;}
-.run-overview-flow {display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:6px;}
+.run-overview-flow {display:flex; align-items:center; justify-content:flex-start; flex-wrap:wrap; gap:6px; margin-top:10px;}
 .run-overview-flow span {display:inline-flex; align-items:center; min-height:27px; padding:0 9px; border:1px solid #dddddd; border-radius:999px; background:#fafafa; color:#444444; font-size:11px; font-weight:650; white-space:nowrap;}
 .run-overview-flow i {color:#aaaaaa; font-size:11px; font-style:normal;}
 #method-overview {margin-top:14px; border:1px solid #dedede !important; border-radius:12px !important; background:#fafafa !important;}
@@ -2223,8 +2222,6 @@ footer {visibility:hidden; height:0;}
   .gradio-container > .main {padding:0 12px 24px !important;}
   .hero {display:block; text-align:center;}
   .hero p {margin-top:5px !important;}
-  .run-overview {display:block;}
-  .run-overview-flow {justify-content:flex-start; margin-top:10px;}
   .pipeline {grid-template-columns:repeat(2,minmax(0,1fr));}
   .processing-pipeline {grid-template-columns:repeat(2,minmax(0,1fr)) !important;}
   #run-rsmem-button {flex:1 1 100% !important;}
@@ -2244,10 +2241,10 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
     with gr.Tab("Run RSMeM"):
         gr.HTML(
             "<section class='run-overview'>"
-            "<div class='run-overview-copy'><b>Real analysis on the original pixels — not a chat about screenshots</b>"
-            "<span>RSMeM plans with structured geoscience knowledge, executes 100+ real raster tools "
-            "on your GeoTIFFs, grounds every answer in tool evidence you can audit and download, "
-            "and learns from confirmed failures across attempts.</span></div>"
+            "<div class='run-overview-copy'><b>A real end-to-end Earth-observation analysis agent</b>"
+            "<span>From raw GeoTIFFs to verified answers — RSMeM plans with geoscience "
+            "knowledge, executes 100+ real raster tools, grounds every result in "
+            "downloadable evidence, and learns from confirmed failures.</span></div>"
             "<div class='run-overview-flow' aria-label='RSMeM workflow'>"
             "<span>Retrieve</span><i>→</i><span>Plan</span><i>→</i><span>Execute</span>"
             "<i>→</i><span>Evaluate</span><i>→</i><span>Reflect</span></div>"
