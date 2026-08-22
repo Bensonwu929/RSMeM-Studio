@@ -264,6 +264,46 @@ class PlannerRobustnessTests(unittest.TestCase):
         self.assertIn("empty reply", str(ctx.exception))
 
 
+class ReflectionConfirmFallbackTests(unittest.TestCase):
+    def _state(self, candidate_status="ok"):
+        return {
+            "status": "awaiting_reflection",
+            "mode": "case",
+            "max_attempts": 3,
+            "attempts": [{"attempt": 1}],
+            "memory": [],
+            "candidates": {
+                "FTRO": {
+                    "status": candidate_status,
+                    "reflection": "Repair the mask threshold before retrying.",
+                    "error": "timeout after 60s" if candidate_status != "ok" else "",
+                },
+            },
+        }
+
+    def test_confirm_falls_back_to_candidate_text_when_edit_box_is_empty(self):
+        state = self._state()
+        with patch.object(app, "_execute_interactive_attempt", lambda s, k: s), \
+             patch.object(app, "_render_interactive_state", lambda s: ("r",) * 20):
+            updated = app.confirm_reflection_and_retry(
+                state, "Candidate 1", "", "", "", "test-key"
+            )[0]
+        self.assertEqual(
+            updated["memory"][-1]["reflection"],
+            "Repair the mask threshold before retrying.",
+        )
+
+    def test_confirm_names_the_broken_candidate_and_its_error(self):
+        state = self._state(candidate_status="error")
+        with self.assertRaises(gr.Error) as ctx:
+            app.confirm_reflection_and_retry(
+                state, "Candidate 1", "", "", "", "test-key"
+            )
+        message = str(ctx.exception)
+        self.assertIn("Candidate 1", message)
+        self.assertIn("timeout after 60s", message)
+
+
 class OAuthRouteTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

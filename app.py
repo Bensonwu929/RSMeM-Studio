@@ -366,7 +366,7 @@ def api_completion(
     user_prompt: str,
     max_tokens: int = 16384,
 ) -> str:
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=180.0)
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -1357,6 +1357,13 @@ def _execute_interactive_attempt_steps(state: dict, api_key: str):
                 trajectory=_reflection_trace(state["attempts"][-1]),
                 ftro_builder=_ftro_candidate_view,
             )
+            _trace_event(
+                state, "reflect",
+                "Reflection candidates: " + ", ".join(
+                    f"{name}={info.get('status')}"
+                    for name, info in state["candidates"].items()
+                ),
+            )
             state["status"] = "awaiting_reflection"
     else:
         state["status"] = (
@@ -1856,6 +1863,12 @@ def request_custom_reflections(state: dict, user_api_key: str):
         )
         _write_debug_trace(updated)
         raise gr.Error(f"Reflection generation failed: {exc}") from exc
+    _trace_event(
+        updated, "reflect",
+        "Reflection candidates: " + ", ".join(
+            f"{name}={info.get('status')}" for name, info in updated["candidates"].items()
+        ),
+    )
     updated["status"] = "awaiting_reflection"
     return (updated, *_render_interactive_state(updated))
 
@@ -1899,12 +1912,22 @@ def confirm_reflection_and_retry(
             f"Failure diagnosis: {user_diagnosis.strip()}\n"
             f"Next-attempt plan: {user_plan.strip()}"
         )
-    if not selection or not reflection:
-        raise gr.Error("Select a successful candidate and confirm a non-empty reflection.")
-    if source != "User-authored":
+    elif selection:
         candidate = state["candidates"].get(source, {})
         if candidate.get("status") != "ok":
-            raise gr.Error("The selected model-generated candidate is unavailable.")
+            reason = str(candidate.get("error", "")).strip()
+            raise gr.Error(
+                f"{selection} is unavailable for this attempt"
+                + (f" ({reason})" if reason else "")
+                + " — choose another candidate or write your own."
+            )
+        if not reflection:
+            # The radio-change event fills the editable box asynchronously; if
+            # the user confirms before it lands, fall back to the candidate
+            # text itself rather than failing.
+            reflection = str(candidate.get("reflection", "")).strip()
+    if not selection or not reflection:
+        raise gr.Error("Select a candidate and confirm a non-empty reflection.")
 
     updated = copy.deepcopy(state)
     updated["memory"].append(
