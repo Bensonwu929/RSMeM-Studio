@@ -213,6 +213,57 @@ class DebugTraceTests(unittest.TestCase):
         self.assertIn("evaluation", str(ctx.exception))
 
 
+class PlannerRobustnessTests(unittest.TestCase):
+    def test_reasoning_blocks_are_stripped_from_model_replies(self):
+        self.assertEqual(
+            app._strip_reasoning("<think>step by step...</think>{\"a\": 1}"),
+            '{"a": 1}',
+        )
+        self.assertEqual(app._strip_reasoning("<think>truncated mid-thought"), "")
+
+    def test_planner_repairs_an_invalid_reply_once(self):
+        replies = iter([
+            "<think>lots of hidden reasoning</think>Sure! I would inspect things first.",
+            '{"tool_chain": [{"tool": "inspect_rasters", "purpose": "inspect", "parameters": {}}]}',
+        ])
+        calls = []
+
+        def fake_completion(api_key, base_url, model, system, user, max_tokens=900):
+            calls.append(user)
+            return app._strip_reasoning(next(replies))
+
+        with patch.object(app, "api_completion", fake_completion), patch.object(
+            app, "discover_workflow_tools", return_value=set(app.SUPPORTED_TOOLS)
+        ):
+            plan = app.plan_toolchain("q", "", "", "key", "https://x/v1", "m")
+        self.assertEqual(plan[0]["tool"], "inspect_rasters")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Your previous reply was invalid", calls[1])
+
+    def test_planner_failure_reports_the_raw_model_reply(self):
+        def fake_completion(api_key, base_url, model, system, user, max_tokens=900):
+            return "I cannot answer in JSON, sorry."
+
+        with patch.object(app, "api_completion", fake_completion), patch.object(
+            app, "discover_workflow_tools", return_value=set(app.SUPPORTED_TOOLS)
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                app.plan_toolchain("q", "", "", "key", "https://x/v1", "m")
+        self.assertIn("Raw model reply", str(ctx.exception))
+        self.assertIn("I cannot answer in JSON", str(ctx.exception))
+
+    def test_empty_reply_from_reasoning_exhaustion_is_explained(self):
+        def fake_completion(api_key, base_url, model, system, user, max_tokens=900):
+            return app._strip_reasoning("<think>never finished thinking")
+
+        with patch.object(app, "api_completion", fake_completion), patch.object(
+            app, "discover_workflow_tools", return_value=set(app.SUPPORTED_TOOLS)
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                app.plan_toolchain("q", "", "", "key", "https://x/v1", "m")
+        self.assertIn("empty reply", str(ctx.exception))
+
+
 class OAuthRouteTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

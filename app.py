@@ -349,6 +349,15 @@ SUPPORTED_TOOLS = {
 }
 
 
+def _strip_reasoning(text: str) -> str:
+    """Drop <think> blocks emitted by reasoning models; an unclosed block
+    means the reply was truncated mid-reasoning, so nothing usable follows."""
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text)
+    if "<think>" in cleaned:
+        cleaned = cleaned.split("<think>", 1)[0]
+    return cleaned.strip()
+
+
 def api_completion(
     api_key: str,
     base_url: str,
@@ -367,7 +376,7 @@ def api_completion(
         temperature=0.2,
         max_tokens=max_tokens,
     )
-    return response.choices[0].message.content or ""
+    return _strip_reasoning(response.choices[0].message.content or "")
 
 
 def extract_json_object(text: str) -> dict | list | None:
@@ -456,8 +465,31 @@ Failure-aware memory from the previous attempt:
 Available executable CPU tool reference:
 {live_reference}
 """
-    raw = api_completion(api_key, base_url, model, system, user, max_tokens=700)
-    return normalize_plan(extract_json_object(raw), live_tools)
+    raw = api_completion(api_key, base_url, model, system, user, max_tokens=1600)
+    for attempt in range(2):
+        if not raw.strip():
+            raise ValueError(
+                "The planner model returned an empty reply — reasoning models can "
+                "spend the whole token budget on hidden thinking. Try again or "
+                "select a different model."
+            )
+        try:
+            return normalize_plan(extract_json_object(raw), live_tools)
+        except ValueError as exc:
+            if attempt == 0:
+                repair = (
+                    f"\n\nYour previous reply was invalid: {exc} "
+                    'Reply again with ONLY one JSON object shaped like '
+                    '{"tool_chain": [{"tool": "...", "purpose": "...", "parameters": {}}]}.'
+                )
+                raw = api_completion(
+                    api_key, base_url, model, system, user + repair, max_tokens=1600
+                )
+            else:
+                snippet = raw.strip()[:400]
+                raise ValueError(
+                    f"{exc} Raw model reply (first 400 chars): {snippet!r}"
+                ) from exc
 
 
 def _normalize_preview_band(array: np.ndarray) -> np.ndarray:
@@ -2407,7 +2439,7 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
                 artifact_output = gr.File(
                     label="Download derived GeoTIFF artifacts", file_count="multiple"
                 )
-            with gr.Accordion("Debug trace", open=False):
+            with gr.Accordion("Debug trace", open=True):
                 gr.Markdown(
                     "Stage-by-stage log of this run — knowledge scores, planned tools, "
                     "real tool observations, model verdicts, and full tracebacks on "
