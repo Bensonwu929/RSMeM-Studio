@@ -545,19 +545,11 @@ def preview_uploaded_rasters(uploaded_files):
 
 def load_example(example_name: str):
     if not example_name:
-        return (
-            "",
-            "No example loaded. Write your own query and attach GeoTIFFs, or select a prepared case below.",
-            None,
-        )
+        return ("", None)
     example = EXAMPLES.get(example_name, EXAMPLES[DEFAULT_EXAMPLE])
     directory = ROOT / "examples" / example["directory"] if example["directory"] else None
     paths = sorted(directory.glob("*.tif")) if directory and directory.is_dir() else []
-    return (
-        example["query"],
-        f"**Included data and workflow:** {example['description']}",
-        raster_preview(paths),
-    )
+    return (example["query"], raster_preview(paths))
 
 
 def prepare_rasters(uploaded_files, run_dir: Path, example_name: str) -> tuple[list[str], str]:
@@ -2373,13 +2365,10 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
                     value=None,
                     info="This fills the query and loads bundled GeoTIFFs; the query remains editable.",
                 )
-                dataset_info = gr.Markdown(
-                    "No example loaded. Choose a case to inspect its data and workflow."
-                )
         example_input.change(
             load_example,
             inputs=[example_input],
-            outputs=[query_input, dataset_info, raster_preview_output],
+            outputs=[query_input, raster_preview_output],
         )
         raster_input.change(
             preview_uploaded_rasters,

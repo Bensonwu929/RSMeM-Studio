@@ -103,10 +103,9 @@ class InteractiveWorkflowTests(unittest.TestCase):
         self.assertLessEqual(max(preview.shape[:2]), 640)
         self.assertEqual(before, self.one_tif.stat().st_mtime_ns)
 
-    def test_loading_case_returns_query_description_and_preview(self):
-        query, description, preview = app.load_example(self.case_name)
+    def test_loading_case_returns_query_and_preview(self):
+        query, preview = app.load_example(self.case_name)
         self.assertEqual(query, app.EXAMPLES[self.case_name]["query"])
-        self.assertIn("Included data and workflow", description)
         self.assertEqual(preview.shape[2], 3)
 
     def test_streaming_run_exposes_each_major_phase_before_final_result(self):
