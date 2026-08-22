@@ -364,7 +364,7 @@ def api_completion(
     model: str,
     system_prompt: str,
     user_prompt: str,
-    max_tokens: int = 900,
+    max_tokens: int = 8192,
 ) -> str:
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
     response = client.chat.completions.create(
@@ -465,7 +465,7 @@ Failure-aware memory from the previous attempt:
 Available executable CPU tool reference:
 {live_reference}
 """
-    raw = api_completion(api_key, base_url, model, system, user, max_tokens=1600)
+    raw = api_completion(api_key, base_url, model, system, user, max_tokens=8192)
     for attempt in range(2):
         if not raw.strip():
             raise ValueError(
@@ -483,7 +483,7 @@ Available executable CPU tool reference:
                     '{"tool_chain": [{"tool": "...", "purpose": "...", "parameters": {}}]}.'
                 )
                 raw = api_completion(
-                    api_key, base_url, model, system, user + repair, max_tokens=1600
+                    api_key, base_url, model, system, user + repair, max_tokens=8192
                 )
             else:
                 snippet = raw.strip()[:400]
@@ -1010,7 +1010,7 @@ Retrieved knowledge: {knowledge_context[:3000]}
 Symbolic critic: {json.dumps(critic_reasons, ensure_ascii=False)}
 GeoTraceCompress output: {json.dumps(compression['trajectory'], ensure_ascii=False)}
 """
-    reflection = api_completion(api_key, base_url, model, system, user, max_tokens=450).strip()
+    reflection = api_completion(api_key, base_url, model, system, user, max_tokens=2048).strip()
     if not reflection:
         raise ValueError("The reflection model returned an empty failure-aware memory.")
     return reflection, compression
@@ -2295,8 +2295,10 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
                 label="Your remote-sensing query",
                 value="",
                 placeholder=(
-                    "Describe the analysis task, available raster bands or dates, "
-                    "and the result you want RSMeM to produce."
+                    "Example: compare the mean nighttime-light intensity of the two "
+                    "attached GeoTIFFs, identify the lower month, and report the "
+                    "absolute difference. Mention your bands or dates and the exact "
+                    "result you want."
                 ),
                 lines=5,
             )
