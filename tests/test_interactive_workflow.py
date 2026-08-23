@@ -412,7 +412,8 @@ def test_run_tab_is_primary_and_overview_content_is_progressively_disclosed():
         if component.get("type") == "html"
     ]
     assert any(
-        "Retrieve" in value and "Evaluate" in value and "Reflect" in value
+        "end-to-end Earth-observation analysis agent" in value
+        and "self-evolving" in value
         for value in html_values
     )
     assert any(
