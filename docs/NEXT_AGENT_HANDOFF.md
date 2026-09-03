@@ -2,7 +2,11 @@
 
 Last updated: 2026-09-03 (Asia/Shanghai)  
 Repository: `/Users/wu/Documents/APGRSS/rsmem-studio-deploy`  
-Stable commit: `80ec984055583872b08c9d7d4f581ca305e8275a`
+Stable commit at last update: `2196bba93182a947d3c6f55885310f0a306609b5`
+
+Commit hashes in this document go stale quickly. Treat them as historical
+context and verify the live state with `git log`, `git branch -vv --all`, and
+`git ls-remote` before relying on them.
 
 ## 1. Read this first
 
@@ -24,23 +28,18 @@ being discussed.
 
 ## 2. Git state and required workflow
 
-At handoff time the following refs all point to the same commit:
+At the last update the following refs pointed to the same commit:
 
 ```text
-local master                    80ec984
-github/master                   80ec984
-modelscope/master               80ec984
-feat/langgraph-react-harness    80ec984
+local master                    2196bba
+github/master                   2196bba
+modelscope/master               2196bba
 ```
 
-The local `master` was fast-forwarded with:
-
-```bash
-git switch master
-git merge --ff-only feat/langgraph-react-harness
-```
-
-The worktree was clean at the time of the fast-forward.
+`feat/langgraph-react-harness` was fast-forwarded into `master` at `80ec984`
+and then left behind at that commit. A stale remote branch
+`modelscope/codex/remove-overview` (`e5f07e2`, 2026-08-21) also still exists.
+Neither has been deleted.
 
 For every new feature or non-trivial fix, follow this process:
 
@@ -49,15 +48,22 @@ git switch master
 git pull --ff-only github master
 git switch -c feat/<short-feature-name>   # or fix/<short-name>
 
-# implement and test
-python -m pytest -q
-git diff --check
+# implement, committing in small single-purpose steps
 
-# only after verification
+# verify
+/Users/wu/anaconda3/bin/python -m pytest -q
+git diff --check
+git diff master...HEAD          # read the entire branch diff
+
+# only after verification and, for visible changes, user approval
 git switch master
 git merge --ff-only feat/<short-feature-name>
 git push github master
 git push modelscope master
+
+# confirm both deployment remotes agree
+git ls-remote github master
+git ls-remote modelscope master
 ```
 
 Do not develop directly on `master`. Do not push a feature branch directly to a
@@ -65,7 +71,126 @@ remote `master` before locally integrating and verifying it. Never force-push a
 deployment branch unless the user explicitly authorizes it and understands the
 risk.
 
-## 3. Remotes and public pages
+## 3. Local development environment
+
+### Worktrees
+
+More than one agent or session may operate on this repository at the same time.
+`git worktree` gives each session its own directory while sharing a single
+object database and a single set of branches.
+
+```text
+/Users/wu/Documents/APGRSS/rsmem-studio-deploy   main checkout
+/Users/wu/Documents/rsmem-studio-wt/master       additional worktree (master)
+```
+
+```bash
+git worktree add /Users/wu/Documents/rsmem-studio-wt/<name> -b feat/<name> master
+git worktree list
+git worktree remove /Users/wu/Documents/rsmem-studio-wt/<name>
+```
+
+Keep worktrees outside `/Users/wu/Documents/APGRSS`, which is itself a Git
+repository and would otherwise report them as untracked directories.
+
+Branches and commits are shared across worktrees, so another session can move
+`master` while you are working. Always `git pull --ff-only github master`
+before branching, and never assume a branch still points where the last
+session left it.
+
+### Python interpreter
+
+The test suite does not run under the Homebrew system interpreter; `gradio`,
+`rasterio`, and `httpx` are absent there and pytest fails during collection.
+Use the Anaconda base environment:
+
+```bash
+/Users/wu/anaconda3/bin/python -m pytest -q
+```
+
+That environment has `gradio` 6.17.3 and completes the suite in roughly 19
+seconds. Run pytest from the repository root; there is no pytest configuration
+file.
+
+### No CI
+
+There is no `.github/workflows` directory and nothing runs automatically on
+push. Local verification is the only gate between an edit and the live Studio.
+
+### Running the app locally
+
+Start `python app.py` from a durable foreground terminal or a controlled
+background process, and clean it up afterwards. A process launched from a
+short-lived tool session dies with that session and produces
+`ERR_CONNECTION_REFUSED`, which is a local lifecycle artifact rather than
+evidence of a deployment failure.
+
+## 4. Development conventions
+
+### Push is deployment
+
+`modelscope/master` is the live Studio; `github/master` is the backup and the
+public code mirror. There is no staging environment, so `master` must be
+deployable at every commit. Push GitHub first so that a trustworthy reference
+copy exists before the live service changes.
+
+### One branch, one concern
+
+Use `feat/<short-name>`, `fix/<short-name>`, or `docs/<short-name>`. Keep
+commits small and single-purpose so that one change can be reverted without
+discarding unrelated work. Do not mix a UI change, an evaluator change, and an
+MCP configuration change into a single commit.
+
+### Verify before merging
+
+Read the complete branch diff rather than trusting a summary of it. Confirm the
+reported test count matches the expected total; a drop must be explained, never
+assumed harmless. `git diff --check` on the working tree must be clean.
+
+Note that `git diff --check` between two commits can report intentional
+Markdown hard line breaks (two trailing spaces) as trailing whitespace. That is
+expected in documentation and is not a defect.
+
+### Never rewrite deployed history
+
+Correct a bad deployed commit with `git revert` followed by a normal push to
+both remotes. Do not force-push `github/master` or `modelscope/master` unless
+the user explicitly authorizes it and understands the consequences.
+
+### Recovery
+
+```bash
+git status                  # current branch and uncommitted changes
+git log --oneline -10       # recent history
+git restore <path>          # discard uncommitted changes to one file
+git restore .               # discard all uncommitted changes
+git commit --amend          # fix the most recent commit
+git reset --soft HEAD~1     # undo the commit, keep the changes
+git reset --hard <commit>   # return to a known commit, discards changes
+git revert <commit>         # safely undo an already-pushed commit
+git reflog                  # recover branches or commits after a mistake
+```
+
+Record `git log -1 --oneline` before any risky operation so there is always a
+known-good commit to return to.
+
+### Secret hygiene
+
+Git history is permanent. Removing a credential in a later commit does not
+remove it from the history that has already been pushed to a public remote. If
+a credential is ever committed, the only correct response is to revoke and
+reissue it at the provider. `.gitignore` covers `ms_deploy.json`, `models/`,
+`*.sqlite`, and model weights, but it cannot protect against a key written
+directly into source. Scan `git diff master...HEAD` before every push.
+
+### Human review checkpoints
+
+- Before implementing: state which files will change and why.
+- After implementing: show the branch diff and the test results.
+- Before deploying: manually exercise the affected browser flow, and obtain
+  explicit user approval for material UI or workflow changes.
+
+## 5. Remotes and public pages
 
 ```text
 github     https://github.com/Bensonwu929/RSMeM-Studio.git
@@ -80,7 +205,7 @@ Public resources:
 - arXiv paper: https://arxiv.org/abs/2607.24772
 - Competition: https://modelscope.cn/events/263
 
-## 4. Product objective
+## 6. Product objective
 
 RSMeM is a knowledge-enhanced memory-evolution framework for remote-sensing
 agents. The Studio should communicate and execute this loop:
@@ -118,7 +243,7 @@ Attempt limits:
 There must be no keyless fake execution or preset “correct-looking” result.
 Correct is correct; incorrect is incorrect.
 
-## 5. Current architecture
+## 7. Current architecture
 
 ### ReAct harness
 
@@ -206,7 +331,7 @@ serialized schema is large (roughly 29k tokens), which is an important latency
 and tool-selection risk. The user previously chose to expose the full catalogue
 first and evaluate tool selection before introducing aggressive routing.
 
-## 6. Current UI decisions
+## 8. Current UI decisions
 
 The public UI is intentionally restrained and uses a Codex-like neutral black,
 white, and gray palette rather than copying another Studio's color scheme.
@@ -280,9 +405,10 @@ Reflection candidates are presented as Candidate 1, Candidate 2, Candidate 3,
 or user-authored text. Do not expose a large raw JSON comparison block in the
 normal UI.
 
-## 7. Tests and verified behavior
+## 9. Tests and verified behavior
 
-The most recent full automated test run reported:
+Run the suite with the Anaconda base interpreter described in section 3. The
+most recent full automated test run reported:
 
 ```text
 95 passed in 20.38s
@@ -325,7 +451,7 @@ This proves sequential observation-driven tool selection in the backend, but it
 does **not** replace a fresh browser end-to-end test of the currently deployed
 UI.
 
-## 8. Known gaps and risks
+## 10. Known gaps and risks
 
 ### Browser end-to-end test is not complete
 
@@ -373,7 +499,7 @@ tests and fail clearly when a provider returns only text instead of callable
 tool structures. Do not fall back to pretending a textual tool plan was
 executed.
 
-## 9. Important local research references
+## 11. Important local research references
 
 Use these only as read-only implementation references unless the user asks to
 modify them:
@@ -397,14 +523,16 @@ The SSH host alias previously used by the user is `QY_11`. Treat remote access
 as read-only unless the user explicitly asks for changes. Never copy server
 secrets into this public repository.
 
-## 10. Definition of done for future changes
+## 12. Definition of done for future changes
 
 Before merging and deploying:
 
-- Work is on a new `feat/*` or `fix/*` branch.
+- Work is on a new `feat/*`, `fix/*`, or `docs/*` branch.
 - No unrelated user changes are overwritten.
-- `python -m pytest -q` passes.
-- `git diff --check` passes.
+- `/Users/wu/anaconda3/bin/python -m pytest -q` passes with no unexplained
+  drop in the test count.
+- `git diff --check` passes on the working tree.
+- The complete `git diff master...HEAD` has been read, not just summarized.
 - No credentials or private data are present in the diff or generated files.
 - Relevant browser flow is manually smoke-tested.
 - At least one real API + MCP case succeeds for changes affecting execution.
@@ -416,7 +544,7 @@ Before merging and deploying:
 - GitHub `master` is pushed first, then ModelScope `master`.
 - Both deployment remotes are verified to point to the same commit.
 
-## 11. Suggested prompt for the next agent
+## 13. Suggested prompt for the next agent
 
 Copy the prompt below into the next task together with this file path:
 
@@ -430,13 +558,17 @@ Before doing any work, read this handoff completely:
 /Users/wu/Documents/APGRSS/rsmem-studio-deploy/docs/NEXT_AGENT_HANDOFF.md
 
 Then inspect the current repository and confirm the current branch, clean/dirty
-state, HEAD commit, GitHub remote commit, and ModelScope remote commit. Treat the
-handoff as context, but verify repository facts directly before modifying code.
+state, HEAD commit, GitHub remote commit, ModelScope remote commit, and the
+output of git worktree list. Treat the handoff as context, but verify repository
+facts directly before modifying code. Another session may be working in a
+different worktree of this same repository.
 
-For every new feature or non-trivial fix, create a new feat/* or fix/* branch
-from current master. Do not develop directly on master. Preserve unrelated
-changes. Use apply_patch for edits. Never write or upload API keys, OAuth
-secrets, ModelScope tokens, or private credentials.
+For every new feature or non-trivial fix, create a new feat/*, fix/*, or docs/*
+branch from current master. Do not develop directly on master. Preserve
+unrelated changes. Use apply_patch for edits. Run tests with
+/Users/wu/anaconda3/bin/python -m pytest -q, not the system interpreter. Never
+write or upload API keys, OAuth secrets, ModelScope tokens, or private
+credentials.
 
 The Studio must remain a real MCP-backed ReAct agent rather than a simulated
 demo. It must not execute without valid model authorization, fabricate tool
