@@ -68,7 +68,6 @@ def ensure_model_assets(models_dir: Path, workspace: Path) -> Path:
             local_dir=str(models_dir),
             token=token,
             max_workers=int(os.getenv("RSMEM_MODEL_DOWNLOAD_WORKERS", "4")),
-            enable_file_lock=True,
         )
         if not assets_ready(models_dir):
             missing = [
