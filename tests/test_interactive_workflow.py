@@ -66,6 +66,36 @@ class InteractiveWorkflowTests(unittest.TestCase):
         self.url_patch = patch.object(app, "validate_base_url", lambda value: value)
         self.url_patch.start()
         self.addCleanup(self.url_patch.stop)
+        self.react_calls = []
+
+        def fake_react_attempt(**kwargs):
+            self.react_calls.append(kwargs)
+            attempt_dir = Path(kwargs["output_dir"])
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+            return {
+                "tool_plan": [{
+                    "tool": "inspect_rasters",
+                    "purpose": "Inspect the real inputs after observing the task.",
+                    "parameters": {},
+                }],
+                "trajectory": [{
+                    "step": 1,
+                    "tool": "inspect_rasters",
+                    "purpose": "Inspect the real inputs.",
+                    "parameters": {},
+                    "status": "success",
+                    "observation": "The supplied raster inputs are readable.",
+                }],
+                "answer": "The supplied raster inputs were inspected; no unsupported numeric claim is made.",
+                "model_calls": 2,
+                "artifacts": [],
+                "checkpoint_path": str(kwargs["checkpoint_path"]),
+                "mcp_health": {"transport": "stdio", "discovered_tools": 117},
+            }
+
+        self.react_patch = patch.object(app, "run_react_attempt", fake_react_attempt)
+        self.react_patch.start()
+        self.addCleanup(self.react_patch.stop)
 
     def _start_case(self, api):
         with patch.object(app, "api_completion", api):
@@ -119,8 +149,9 @@ class InteractiveWorkflowTests(unittest.TestCase):
         for update in updates:
             self.assertEqual(len(update), 21)
         progress_html = "\n".join(str(update[2]) for update in updates[:-1])
-        for label in ("Plan", "Execute", "Answer", "Evaluate"):
+        for label in ("ReAct agent loop", "Answer", "Evaluate"):
             self.assertIn(label, progress_html)
+        self.assertNotIn("Starting a bounded ReAct loop", progress_html)
         self.assertEqual(updates[-1][0]["status"], "completed_case_correct")
 
     def test_custom_query_requires_uploaded_rasters_when_no_case_is_loaded(self):
@@ -175,9 +206,10 @@ class InteractiveWorkflowTests(unittest.TestCase):
             }],
         }
         rendered = app._attempts_interactive_html(state)
-        self.assertIn("Planned tool chain", rendered)
-        self.assertIn("Answer synthesized from tool evidence", rendered)
+        self.assertIn("Tool calls", rendered)
+        self.assertIn("Observation", rendered)
         self.assertIn('class="badge ok"', rendered)
+        self.assertNotIn('<details class="step-card" open>', rendered)
         self.assertIn("&lt;script&gt;", rendered)
         self.assertNotIn("<script>alert(1)</script>", rendered)
         self.assertNotIn("#### Evaluation", rendered)
@@ -211,9 +243,10 @@ class InteractiveWorkflowTests(unittest.TestCase):
         self.assertFalse(rendered[8]["visible"])
         self.assertIn("your decision is final", rendered[6])
         self.assertIn("skipped: no relevant match", rendered[1])
-        self.assertIn('class="stage current"><span>6</span><b>Human</b>', rendered[1])
-        self.assertIn("### Task", rendered[16])
+        self.assertIn('class="stage current"><span>5</span><b>Human</b>', rendered[1])
+        self.assertIn("### User query", rendered[16])
         self.assertIn("Supported answer.", rendered[16])
+        self.assertIn("### Evaluator assessment", rendered[16])
 
     def test_reflection_stage_is_current_only_while_reflection_is_pending(self):
         state = {
@@ -228,8 +261,8 @@ class InteractiveWorkflowTests(unittest.TestCase):
             }],
         }
         rendered = app._interactive_timeline(state)
-        self.assertIn('class="stage current"><span>7</span><b>Reflect</b>', rendered)
-        self.assertIn('class="stage skip"><span>6</span><b>Human</b>', rendered)
+        self.assertIn('class="stage current"><span>6</span><b>Reflect</b>', rendered)
+        self.assertIn('class="stage skip"><span>5</span><b>Human</b>', rendered)
 
     def test_successful_builtin_case_marks_reflection_as_skipped(self):
         state = {
@@ -244,7 +277,7 @@ class InteractiveWorkflowTests(unittest.TestCase):
             }],
         }
         rendered = app._interactive_timeline(state)
-        self.assertIn('class="stage skip"><span>7</span><b>Reflect</b>', rendered)
+        self.assertIn('class="stage skip"><span>6</span><b>Reflect</b>', rendered)
         self.assertIn("CORRECT", rendered)
 
     def test_all_low_score_knowledge_is_removed_from_ui_and_context(self):
@@ -323,9 +356,11 @@ class InteractiveWorkflowTests(unittest.TestCase):
             )[0]
         self.assertEqual(state2["status"], "completed_case_correct")
         self.assertEqual(state2["memory"][0]["source"], "FTRO")
-        planner_prompts = [user for system, user in api.calls if "planner inside RSMeM" in system]
-        self.assertIn(chosen, planner_prompts[-1])
-        self.assertNotIn(state["candidates"].get("Full trajectory", {}).get("reflection", "__missing__"), planner_prompts[-1])
+        self.assertEqual(self.react_calls[-1]["failure_memory"], chosen)
+        self.assertNotEqual(
+            self.react_calls[-1]["failure_memory"],
+            state["candidates"].get("Full trajectory", {}).get("reflection", "__missing__"),
+        )
 
     def test_case_stops_at_three_incorrect_attempts(self):
         api = StudioApi(["incorrect", "incorrect", "incorrect"])
@@ -413,29 +448,32 @@ def test_run_tab_is_primary_and_overview_content_is_progressively_disclosed():
     ]
     assert any(
         "end-to-end Earth-observation analysis agent" in value
-        and "self-evolving" in value
         for value in html_values
     )
+    assert not any("From remote-sensing imagery to verified answers" in value for value in html_values)
     assert any(
         component.get("props", {}).get("label") == "Method overview and paper figures"
         for component in config["components"]
     )
 
 
-def test_results_flow_is_single_column_with_agent_trace_before_evidence():
+def test_results_flow_is_summary_then_agent_trace_then_evidence():
     config = app.demo.get_config_file()
     markdown_values = [
         str(component.get("props", {}).get("value", ""))
         for component in config["components"]
         if component.get("type") == "markdown"
     ]
+    summary_index = next(
+        i for i, value in enumerate(markdown_values) if value.startswith("## Summary")
+    )
     trace_index = next(
         i for i, value in enumerate(markdown_values) if value.startswith("## Agent trace")
     )
     evidence_index = next(
         i for i, value in enumerate(markdown_values) if value.startswith("## Evidence")
     )
-    assert trace_index < evidence_index
+    assert summary_index < trace_index < evidence_index
     assert not any("Task & decision" in value for value in markdown_values)
     assert not any("Memory-evolution trace" in value for value in markdown_values)
 

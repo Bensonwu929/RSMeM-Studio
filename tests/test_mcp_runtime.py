@@ -44,13 +44,14 @@ def test_runtime_starts_four_cpu_servers_and_discovers_extensions(tmp_path):
         health = runtime.health()
         assert health["transport"] == "stdio"
         assert health["enabled_servers"] == ["Analysis", "Index", "Inversion", "Statistics"]
-        assert health["disabled_servers"] == ["Perception"]
+        assert health["disabled_servers"] == ["Perception", "OEA_Perception"]
         assert health["discovered_tools"] >= 100
         assert "Analysis.studio_linear_trend" in runtime.catalog
         assert "Index.studio_calculate_ndvi" in runtime.catalog
         assert "Inversion.studio_lst_single_channel" in runtime.catalog
         assert "Statistics.studio_inspect_rasters" in runtime.catalog
         assert not any(key.startswith("Perception.") for key in runtime.catalog)
+        assert not any(key.startswith("OEA_Perception.") for key in runtime.catalog)
     finally:
         runtime.close()
 
@@ -102,4 +103,48 @@ def test_sync_facade_routes_calls_to_discovered_mcp_tool(monkeypatch):
             "studio_linear_trend",
             {"values": [1.0, 3.0], "x": [0.0, 1.0]},
         )
+    ]
+
+
+def test_gpu_servers_are_opt_in_and_unhealthy_workers_are_not_planner_visible(tmp_path, monkeypatch):
+    monkeypatch.setenv("RSMEM_ENABLE_GPU_PERCEPTION", "1")
+    runtime = mcp_runtime.MCPRuntime(tmp_path, timeout=30).start()
+    try:
+        health = runtime.health()
+        aliases = runtime.workflow_aliases()
+        assert health["enabled_servers"] == [
+            "Analysis", "Index", "Inversion", "Statistics", "Perception", "OEA_Perception"
+        ]
+        assert "Perception.available_tools" in runtime.catalog
+        assert "OEA_Perception.available_tools" in runtime.catalog
+        assert not (mcp_runtime.GPU_NATIVE_TOOLS["Perception"] & runtime.live_gpu_tools["Perception"])
+        assert not (mcp_runtime.GPU_NATIVE_TOOLS["OEA_Perception"] & runtime.live_gpu_tools["OEA_Perception"])
+        assert not ({
+            "remoteclip_classify", "sam2_segment", "earthbench_change_detection",
+            "earthbench_damage_assessment", "text_to_bbox", "object_detection",
+            "image_description", "region_attribute_description", "count_given_object", "ocr_image",
+        } & aliases)
+    finally:
+        runtime.close()
+
+
+def test_call_workflow_tool_uses_binding(monkeypatch):
+    calls = []
+
+    class FakeRuntime:
+        def call(self, service, tool, arguments):
+            calls.append((service, tool, arguments))
+            return {"predicted_class": "Forest"}
+
+    token = mcp_runtime._ACTIVE_RUNTIME.set(FakeRuntime())
+    try:
+        result = mcp_runtime.call_workflow_tool(
+            "remoteclip_classify", {"input_image_path": "/tmp/example.tif"}
+        )
+    finally:
+        mcp_runtime._ACTIVE_RUNTIME.reset(token)
+
+    assert result["predicted_class"] == "Forest"
+    assert calls == [
+        ("Perception", "RemoteCLIP", {"input_image_path": "/tmp/example.tif"})
     ]

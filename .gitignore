@@ -1,3 +1,11 @@
 ms_deploy.json
 __pycache__/
 *.pyc
+models/
+gpu-logs/
+*.pth
+*.pt
+*.safetensors
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

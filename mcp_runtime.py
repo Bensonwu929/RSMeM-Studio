@@ -1,4 +1,4 @@
-"""Synchronous facade over four real stdio MCP sessions for the Gradio app."""
+"""Synchronous facade over the RSMeM stdio MCP tool processes."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from mcp.client.stdio import stdio_client
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "configs" / "agent_mcp.json"
 CPU_SERVERS = ("Analysis", "Index", "Inversion", "Statistics")
-DISABLED_SERVERS = ("Perception",)
+GPU_SERVERS = ("Perception", "OEA_Perception")
 
 WORKFLOW_BINDINGS = {
     "inspect_rasters": ("Statistics", "studio_inspect_rasters"),
@@ -52,7 +52,38 @@ WORKFLOW_BINDINGS = {
     "maximum_composite": ("Statistics", "studio_maximum_composite"),
     "identify_fire_prone_areas": ("Statistics", "studio_fire_prone_mask"),
     "subtract": ("Statistics", "studio_subtract_rasters"),
+    "remoteclip_classify": ("Perception", "RemoteCLIP"),
+    "sam2_segment": ("Perception", "SAM2"),
+    "earthbench_change_detection": ("Perception", "ChangeOS"),
+    "earthbench_damage_assessment": ("Perception", "BRIGHT_DamageAssessment"),
+    "text_to_bbox": ("OEA_Perception", "TextToBbox"),
+    "object_detection": ("OEA_Perception", "ObjectDetection"),
+    "image_description": ("OEA_Perception", "ImageDescription"),
+    "region_attribute_description": ("OEA_Perception", "RegionAttributeDescription"),
+    "count_given_object": ("OEA_Perception", "CountGivenObject"),
+    "ocr_image": ("OEA_Perception", "OCR"),
 }
+
+GPU_NATIVE_TOOLS = {
+    "Perception": {
+        "RemoteCLIP", "SAM2", "ChangeOS", "BRIGHT_DamageAssessment",
+    },
+    "OEA_Perception": {
+        "TextToBbox", "ObjectDetection", "ImageDescription",
+        "RegionAttributeDescription", "CountGivenObject", "OCR",
+    },
+}
+
+
+def gpu_perception_enabled(environment: dict[str, str] | None = None) -> bool:
+    source = os.environ if environment is None else environment
+    return source.get("RSMEM_ENABLE_GPU_PERCEPTION", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def configured_servers(environment: dict[str, str] | None = None) -> tuple[str, ...]:
+    return CPU_SERVERS + (GPU_SERVERS if gpu_perception_enabled(environment) else ())
 
 
 class MCPRuntimeError(RuntimeError):
@@ -89,14 +120,13 @@ def _decode_result(result: Any) -> Any:
 
 def discover_workflow_tools(timeout: float = 90.0) -> frozenset[str]:
     """Discover the planner-visible aliases from live MCP list_tools responses."""
+    active = _ACTIVE_RUNTIME.get()
+    if active is not None:
+        return active.workflow_aliases()
     with tempfile.TemporaryDirectory(prefix="rsmem_mcp_discovery_") as directory:
         runtime = MCPRuntime(Path(directory), timeout=timeout).start()
         try:
-            return frozenset(
-                alias
-                for alias, (service, tool) in WORKFLOW_BINDINGS.items()
-                if f"{service}.{tool}" in runtime.catalog
-            )
+            return runtime.workflow_aliases()
         finally:
             runtime.close()
 
@@ -104,7 +134,12 @@ def discover_workflow_tools(timeout: float = 90.0) -> frozenset[str]:
 class MCPRuntime:
     """Own one background event loop and four persistent stdio MCP processes."""
 
-    def __init__(self, output_dir: Path, timeout: float = 90.0):
+    def __init__(
+        self,
+        output_dir: Path,
+        timeout: float = 90.0,
+        servers: tuple[str, ...] | None = None,
+    ):
         self.output_dir = Path(output_dir).resolve()
         self.timeout = timeout
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -114,15 +149,17 @@ class MCPRuntime:
         self._startup_error: BaseException | None = None
         self._sessions: dict[str, ClientSession] = {}
         self.catalog: dict[str, dict] = {}
+        self.servers = configured_servers() if servers is None else tuple(servers)
+        self.live_gpu_tools: dict[str, set[str]] = {}
 
     def start(self) -> "MCPRuntime":
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
         if not self._ready.wait(self.timeout):
-            raise MCPRuntimeError("Timed out while starting the CPU MCP servers.")
+            raise MCPRuntimeError("Timed out while starting the MCP servers.")
         if self._startup_error:
-            raise MCPRuntimeError(f"CPU MCP startup failed: {self._startup_error}")
+            raise MCPRuntimeError(f"MCP startup failed: {self._startup_error}")
         return self
 
     def _thread_main(self) -> None:
@@ -137,7 +174,7 @@ class MCPRuntime:
         clean_env = sanitized_subprocess_environment()
         configuration = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["mcpServers"]
         async with AsyncExitStack() as stack:
-            for service in CPU_SERVERS:
+            for service in self.servers:
                 server = configuration[service]
                 args = list(server["args"])
                 if "--temp_dir" in args:
@@ -147,7 +184,7 @@ class MCPRuntime:
                     command=sys.executable if server["command"] in {"python", "python3"} else server["command"],
                     args=args,
                     cwd=str(ROOT),
-                    env=clean_env,
+                    env={**clean_env, **server.get("env", {})},
                 )
                 read_stream, write_stream = await stack.enter_async_context(stdio_client(params))
                 session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
@@ -161,6 +198,10 @@ class MCPRuntime:
                         "description": tool.description or "",
                         "inputSchema": tool.inputSchema,
                     }
+                if service in GPU_SERVERS and f"{service}.available_tools" in self.catalog:
+                    available = await session.call_tool("available_tools", {})
+                    decoded = _decode_result(available)
+                    self.live_gpu_tools[service] = set(decoded if isinstance(decoded, list) else [])
             self._ready.set()
             while not self._stop.is_set():
                 await asyncio.sleep(0.05)
@@ -184,11 +225,32 @@ class MCPRuntime:
     def health(self) -> dict:
         return {
             "transport": "stdio",
-            "enabled_servers": list(CPU_SERVERS),
-            "disabled_servers": list(DISABLED_SERVERS),
+            "enabled_servers": list(self.servers),
+            "disabled_servers": [name for name in GPU_SERVERS if name not in self.servers],
+            "live_gpu_tools": {
+                service: sorted(tools) for service, tools in self.live_gpu_tools.items()
+            },
             "discovered_tools": len(self.catalog),
             "config": str(CONFIG_PATH),
         }
+
+    def workflow_aliases(self) -> frozenset[str]:
+        aliases = []
+        for alias, (service, tool) in WORKFLOW_BINDINGS.items():
+            if f"{service}.{tool}" not in self.catalog:
+                continue
+            if service in GPU_SERVERS and tool not in self.live_gpu_tools.get(service, set()):
+                continue
+            aliases.append(alias)
+        return frozenset(aliases)
+
+    def is_tool_available(self, service: str, tool: str) -> bool:
+        """Whether a discovered tool may be exposed to the planning agent."""
+        if f"{service}.{tool}" not in self.catalog:
+            return False
+        if service not in GPU_SERVERS:
+            return True
+        return tool in self.live_gpu_tools.get(service, set())
 
 
 _ACTIVE_RUNTIME: contextvars.ContextVar[MCPRuntime | None] = contextvars.ContextVar(
@@ -210,8 +272,15 @@ def workflow_mcp(output_dir: Path):
 def _call(service: str, tool: str, **arguments):
     runtime = _ACTIVE_RUNTIME.get()
     if runtime is None:
-        raise MCPRuntimeError("CPU tool call attempted outside an MCP workflow session.")
+        raise MCPRuntimeError("Tool call attempted outside an MCP workflow session.")
     return runtime.call(service, tool, arguments)
+
+
+def call_workflow_tool(alias: str, arguments: dict):
+    if alias not in WORKFLOW_BINDINGS:
+        raise MCPRuntimeError(f"Unknown workflow tool alias: {alias}")
+    service, tool = WORKFLOW_BINDINGS[alias]
+    return _call(service, tool, **arguments)
 
 
 def inspect_rasters(paths):

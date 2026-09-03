@@ -14,11 +14,11 @@
     },
     "Perception": {
       "command": "python",
-      "args": ["tools/Perception.py", "--temp_dir", "tmp/tmp/out"],
-      "env": {
-        "REMOTECLIP_API_URL": "http://127.0.0.1:5556/classify",
-        "REMOTECLIP_HEALTH_URL": "http://127.0.0.1:5556/health"
-      }
+      "args": ["tools/Perception.py", "--temp_dir", "tmp/tmp/out"]
+    },
+    "OEA_Perception": {
+      "command": "python",
+      "args": ["tools/OEA_Perception.py", "--controller-url", "http://127.0.0.1:21001"]
     },
     "Statistics": {
       "command": "python",

@@ -13,6 +13,8 @@ tags:
   - remote-sensing
   - geoscience
   - agents
+models:
+  - wbx929/RSMeM-Perception-Models
 ---
 
 # RSMeM: Knowledge-Enhanced Memory Evolution for Remote Sensing Agents
@@ -25,8 +27,8 @@ Grounding, which retrieves structured geoscience knowledge for tool planning,
 with Failure-Aware Experience Refinement, which converts failed trajectories into
 reusable execution constraints. The public Studio demonstrates the complete
 retrieve-plan-execute-judge-reflect-confirm-retry loop on thirteen remote-sensing cases. Its
-CPU-only raster toolchain produces auditable GeoTIFF outputs and supports
-visitor-provided OpenAI-compatible models without storing API credentials.
+MCP toolchain combines auditable raster operations with health-gated GPU
+perception and supports visitor-provided models without storing API credentials.
 
 - Studio: https://modelscope.cn/studios/wbx929/RSMeM
 - Learn article: [RSMeM on ModelScope Learn](https://modelscope.cn/learn/435887)
@@ -36,14 +38,14 @@ RSMeM combines Hierarchical Knowledge Grounding (HKG) and Failure-Aware
 Experience Refinement (FAR) to improve the reliability and reproducibility of
 multi-step remote-sensing agents.
 
-This ModelScope Studio provides a CPU-friendly, executable demonstration of the
-core memory workflow. It retrieves structured domain knowledge, plans and runs
-real raster operations, synthesizes an evidence-grounded answer, applies either a
+This ModelScope xGPU Studio provides an executable demonstration of the
+core memory workflow. It retrieves structured domain knowledge, runs a ReAct
+reason–tool–observe loop over real raster operations, synthesizes an evidence-grounded answer, applies either a
 reference-aware case judge or a ground-truth-free Teacher Failure Gate, and lets
 the user choose which reflection enters memory.
-The Studio starts the released Analysis, Index, Inversion, and Statistics
-servers as four independent stdio MCP processes. The full experimental
-framework and GPU Perception stack remain available in the public repository.
+The Studio starts Analysis, Index, Inversion, Statistics, EarthBench Perception,
+and OEA Perception as independent stdio MCP processes. GPU tools are visible to
+the ReAct agent only while their local model worker reports healthy.
 
 ## Observable RSMeM loop
 
@@ -51,12 +53,14 @@ The interactive workflow mirrors the control flow implemented by the released
 framework:
 
 1. Retrieve query-relevant hierarchical knowledge (HKG).
-2. Plan a short remote-sensing tool chain.
-3. Discover the live CPU tool catalog with MCP `list_tools`, execute selected
-   operations with MCP `call_tool`, and record parameters, observations, and
-   downloadable artifacts.
+2. Discover the live tool catalog with MCP `list_tools` and give it to a
+   LangChain/LangGraph ReAct agent.
+3. Let the model choose an MCP `call_tool`, observe its real result, and adapt
+   the next tool call until it has enough evidence; record every parameter,
+   observation, and downloadable artifact.
 4. Synthesize a final answer using only real tool evidence.
-5. Evaluate bundled cases with a reference-aware LLM judge; evaluate uploads
+5. Evaluate bundled cases with a conservative deterministic contract first and
+   fall back to a reference-aware LLM judge when the contract is inconclusive; evaluate uploads
    with a ground-truth-free Teacher Failure Gate whose advice the user may
    accept or override.
 6. When retrying, generate three comparable repairs: **FTRO**, **raw full
@@ -70,15 +74,15 @@ framework:
    or three attempts; uploads stop when the user accepts or after ten attempts.
 
 Reference answers are isolated inside the case judge and never enter the
-reflector or next planner. For uploads, the Teacher Failure Gate has no answer
+reflector or next ReAct attempt. For uploads, the Teacher Failure Gate has no answer
 key and provides advisory evidence only; the user's decision is authoritative.
 
-The hosted Studio accepts optional `.tif`/`.tiff` uploads and recognizes common
+The hosted Studio accepts `.tif`, `.tiff`, `.png`, `.jpg`, and `.jpeg` uploads.
+Raster calculations recognize common
 band names such as `B4_red`, `B5_nir`, `B6_swir1`, and `B7_swir2`. Single-band
-files are safest because raster calculations read band 1. JPG, PNG, NetCDF,
-and HDF are not accepted by this CPU deployment. The separate GPU perception
-services in the full RSMeM repository can process ordinary image inputs, but
-they are intentionally not connected here. If no files are uploaded, visitors
+files are safest because raster calculations read band 1. PNG and JPEG inputs
+are routed only to compatible perception tools; NetCDF and HDF are not accepted.
+If no files are uploaded, visitors
 can run one of thirteen bundled demonstrations:
 
 1. Sichuan agricultural drought: NDVI + LST → TVDI → dry-area ratio.
@@ -95,9 +99,11 @@ can run one of thirteen bundled demonstrations:
 12. Thailand: MaxFRP composite → fire-prone upper-quartile mask.
 13. Shanghai: total minus non-residential volume → 1985–2020 trend.
 
-The CPU runtime exposes the four released EarthAgent/RSMeM MCP services plus
-rasterio-only case adapters: **Analysis, Index, Inversion, and Statistics**.
-GPU-backed **Perception** is explicitly disabled on the free CPU instance.
+The runtime exposes four raster MCP services—**Analysis, Index, Inversion, and
+Statistics**—plus two perception façades: **EarthBench Perception** and **OEA
+Perception**. The xGPU resident profile covers RemoteCLIP, SAM2, ChangeOS,
+BRIGHT, Grounding DINO, LAE-DINO, Qwen3-VL, and OCR. An unavailable worker is
+removed from the ReAct tool catalog rather than replaced with a fake result.
 
 ## Data attribution
 
@@ -134,13 +140,69 @@ explicit error; the Studio never replaces model planning with a preset fallback.
 
 ## Local launch
 
+The interactive backend uses a bounded LangChain/LangGraph ReAct loop over the
+live stdio MCP catalogue. See [docs/REACT_HARNESS.md](docs/REACT_HARNESS.md) for
+budgets, SQLite checkpoint semantics, provider compatibility probes, and the
+20-case tool-selection benchmark.
+
 ```bash
 pip install -r requirements.txt
 python app.py
 ```
 
-## Scope
+## xGPU perception deployment
 
-The Studio is an executable artifact for the Open Source GeoAI Practice
-Challenge. It runs four CPU MCP services, but does not claim to run the GPU
-Perception service or the complete EarthBench evaluation.
+The exact resident models, QY_11 source paths, upstream links, and xGPU target
+paths are listed in [`XGPU_MODEL_MANIFEST.md`](XGPU_MODEL_MANIFEST.md).
+
+Large sources and checkpoints are deliberately excluded from Git. Keep them on
+the persistent xGPU volume (default `/mnt/workspace`):
+
+```bash
+export MODELSCOPE_API_TOKEN=...  # configure as a ModelScope Studio secret
+python scripts/prepare_xgpu_workspace.py --download-deployment-bundle
+python scripts/prepare_xgpu_workspace.py --bootstrap-envs
+python scripts/prepare_xgpu_workspace.py  # validates every required asset
+pip install -r requirements-xgpu.txt
+```
+
+`snapshot_download()` is guarded by exact-file validation and an inter-process
+lock. It runs only when the persistent `/mnt/workspace/models` bundle is absent
+or incomplete; ordinary user requests never download weights. The private
+deployment bundle defaults to
+`wbx929/RSMeM-Perception-Models` and can be overridden with
+`RSMEM_MODELSCOPE_MODEL_REPO`.
+
+The environment bootstrap is also persistent and lock-protected. It creates
+three isolated Python 3.10 prefixes (`earthbench`, `oea-e1`, and `oea-e3`) under
+`/mnt/workspace/envs`; subsequent Studio restarts reuse their completion markers.
+Set `RSMEM_CONDA_EXE` only when `conda`, `mamba`, or `micromamba` is not already
+on `PATH`. `RSMEM_GPU_BOOTSTRAP_ENVS=0` disables automatic environment creation.
+
+After cloning the public sources, the bootstrap applies three small,
+version-controlled worker fixes from [`xgpu_workers/`](xgpu_workers/README.md).
+These are the same ChangeOS preprocessing, LAE-DINO/BERT compatibility, and
+safe-registration versions exercised on QY_11; no model implementation is
+replaced by a mock or placeholder.
+
+The second command reports the remaining EarthBench, Grounding-DINO, and
+LAE-DINO checkpoints that must be copied into `/mnt/workspace/models`. Configure
+separate Python interpreters when OEA's E1/E3 dependencies cannot coexist:
+
+```bash
+export RSMEM_GPU_AUTOSTART=1
+export RSMEM_ENABLE_GPU_PERCEPTION=1
+export RSMEM_OEA_E1_PYTHON=/mnt/workspace/envs/oea-e1/bin/python
+export RSMEM_OEA_E3_PYTHON=/mnt/workspace/envs/oea-e3/bin/python
+export RSMEM_EARTHBENCH_PYTHON=/mnt/workspace/envs/earthbench/bin/python
+```
+
+Optional `RSMEM_GPU_SERVICES` is a comma-separated allowlist of service names
+from `gpu_service_manager.py`. Default concurrency is one request per OEA
+worker. Logs go to `/mnt/workspace/rsmem-gpu-logs`; no credential or checkpoint
+is committed to this repository.
+
+The recommended 48 GB resident profile is approximately 37.6 GB after warm-up.
+Keep steady allocation below 40 GB and peak allocation below 44 GB. Do not run
+the legacy `start_all.sh`, because it also starts the redundant/on-demand models
+and may stop already healthy services.

@@ -1,4 +1,4 @@
-"""Public RSMeM agent with model-authored planning and real CPU raster tools."""
+"""Public RSMeM agent with model-authored planning and MCP geospatial tools."""
 
 from __future__ import annotations
 
@@ -23,9 +23,11 @@ import rasterio
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from openai import OpenAI
+from PIL import Image
 from rasterio.enums import Resampling
 
 import modelscope_oauth as msoauth
+from gpu_service_manager import start_configured_gpu_services
 
 from mcp_runtime import (
     apparent_thermal_inertia,
@@ -56,6 +58,7 @@ from mcp_runtime import (
     max_value_and_index as mcp_max_value_and_index,
     validate_inputs as mcp_validate_inputs,
     validate_result as mcp_validate_result,
+    call_workflow_tool,
     discover_workflow_tools,
     workflow_mcp,
 )
@@ -66,9 +69,12 @@ from workflow_logic import (
     synthesize_answer,
     teacher_failure_gate,
 )
+from deterministic_evaluator import evaluate_case_deterministically
+from react_harness import MAX_MODEL_CALLS_PER_ATTEMPT, run_react_attempt
 
 
 ROOT = Path(__file__).resolve().parent
+GPU_SERVICE_MANAGER = start_configured_gpu_services()
 KB_PATH = ROOT / "knowledge_base.json"
 CASE_REFERENCE_PATH = ROOT / "case_references.json"
 
@@ -78,8 +84,8 @@ PROJECT_ABSTRACT = (
     "It combines Hierarchical Knowledge Grounding, which retrieves structured geoscience knowledge "
     "for tool planning, with Failure-Aware Experience Refinement, which converts failed trajectories "
     "into reusable execution constraints. The public Studio implements the complete "
-    "retrieve-plan-execute-judge-reflect-confirm-retry loop on thirteen remote-sensing cases. Its CPU-only raster "
-    "toolchain produces auditable GeoTIFF outputs and supports visitor-provided OpenAI-compatible "
+    "retrieve-plan-execute-judge-reflect-confirm-retry loop on thirteen remote-sensing cases. Its MCP toolchain "
+    "combines auditable raster operations with health-gated GPU perception and supports visitor-provided "
     "models without storing API credentials."
 )
 GITHUB_URL = "https://github.com/AI9Stars/RSMeM"
@@ -333,9 +339,19 @@ TOOL_REFERENCE = """
 - analyze_hotspot_direction: summarize the spatial concentration of low-NBR fire masks.
 - identify_fire_prone_areas: map the upper quartile of positive MaxFRP observations.
 - subtract: derive residential building volume from total and non-residential rasters.
+- remoteclip_classify: classify land-use or scene type from a remote-sensing image with RemoteCLIP.
+- sam2_segment: segment an object from a pixel bounding box with EarthBench SAM2.
+- earthbench_change_detection: map semantic change between aligned pre-event and post-event images with ChangeOS.
+- earthbench_damage_assessment: classify building damage from aligned pre/post disaster images with BRIGHT.
+- text_to_bbox: ground an English object phrase to pixel bounding boxes with OEA Grounding DINO.
+- object_detection: detect remote-sensing objects with OEA LAE-DINO.
+- image_description: describe visible content with the OEA vision-language model.
+- region_attribute_description: describe a requested attribute in an optional image region.
+- count_given_object: count visible instances of a requested object.
+- ocr_image: recognize text visible in a remote-sensing image.
 """.strip()
 
-SUPPORTED_TOOLS = {
+CPU_SUPPORTED_TOOLS = {
     "inspect_rasters", "get_filelist", "validate_inputs", "calculate_ndwi",
     "calculate_ndvi", "calculate_nbr", "compute_tvdi", "calculate_threshold_ratio",
     "create_threshold_mask", "calculate_area", "calculate_mask_area",
@@ -347,6 +363,13 @@ SUPPORTED_TOOLS = {
     "analyze_hotspot_direction", "maximum_composite",
     "identify_fire_prone_areas", "subtract",
 }
+GPU_SUPPORTED_TOOLS = {
+    "remoteclip_classify", "sam2_segment", "earthbench_change_detection",
+    "earthbench_damage_assessment", "text_to_bbox", "object_detection",
+    "image_description", "region_attribute_description", "count_given_object",
+    "ocr_image",
+}
+SUPPORTED_TOOLS = CPU_SUPPORTED_TOOLS | GPU_SUPPORTED_TOOLS
 
 
 def _strip_reasoning(text: str) -> str:
@@ -443,7 +466,7 @@ def plan_toolchain(
     if not api_key:
         raise ValueError("An API key is required for RSMeM planning.")
     live_tools = discover_workflow_tools()
-    missing = SUPPORTED_TOOLS - set(live_tools)
+    missing = CPU_SUPPORTED_TOOLS - set(live_tools)
     if missing:
         raise ValueError(f"Required MCP tools were not discovered: {', '.join(sorted(missing))}")
     live_reference = "\n".join(
@@ -453,6 +476,7 @@ def plan_toolchain(
     system = """You are the planner inside RSMeM. Select a short remote-sensing tool chain.
 Return ONLY JSON with a tool_chain array. Each item must contain tool, purpose, and parameters.
 Use only tools in the supplied reference. Always inspect inputs before band-dependent tools.
+Use raster tools for GeoTIFF values and GPU perception tools for visual interpretation of TIFF/JPEG/PNG inputs.
 Do not claim execution has happened. If prior failure-aware memory is present, revise the plan."""
     user = f"""Query: {query[:3000]}
 
@@ -462,7 +486,7 @@ Retrieved HKG knowledge:
 Failure-aware memory from the previous attempt:
 {reflection[:2000] or "(none; this is the first attempt)"}
 
-Available executable CPU tool reference:
+Available executable MCP tool reference (GPU tools appear only when their worker is healthy):
 {live_reference}
 """
     raw = api_completion(api_key, base_url, model, system, user, max_tokens=16384)
@@ -511,9 +535,17 @@ def raster_preview(paths) -> np.ndarray | None:
         Path(item) if isinstance(item, (str, os.PathLike)) else Path(item.name)
         for item in (paths or [])
     ]
-    raster_paths = [path for path in raster_paths if path.suffix.lower() in {".tif", ".tiff"} and path.is_file()]
+    raster_paths = [
+        path for path in raster_paths
+        if path.suffix.lower() in {".tif", ".tiff", ".png", ".jpg", ".jpeg"} and path.is_file()
+    ]
     if not raster_paths:
         return None
+
+    if raster_paths[0].suffix.lower() in {".png", ".jpg", ".jpeg"}:
+        image = Image.open(raster_paths[0]).convert("RGB")
+        image.thumbnail((640, 640))
+        return np.asarray(image)
 
     channels = []
     target_height = target_width = None
@@ -556,17 +588,17 @@ def prepare_rasters(uploaded_files, run_dir: Path, example_name: str) -> tuple[l
     paths = []
     for item in uploaded_files or []:
         source = Path(getattr(item, "name", item))
-        if source.suffix.lower() in {".tif", ".tiff"} and source.is_file():
+        if source.suffix.lower() in {".tif", ".tiff", ".png", ".jpg", ".jpeg"} and source.is_file():
             paths.append(str(source.resolve()))
     if paths:
-        return paths, "visitor-uploaded GeoTIFFs"
+        return paths, "visitor-uploaded remote-sensing imagery"
     example = EXAMPLES.get(example_name, EXAMPLES[DEFAULT_EXAMPLE])
     if example["directory"]:
         directory = ROOT / "examples" / example["directory"]
         bundled = sorted(str(path.resolve()) for path in directory.glob("*.tif"))
         if bundled:
             return bundled, f"bundled remote-sensing case: {example_name}"
-    raise gr.Error("Custom GeoTIFF mode requires at least one uploaded .tif or .tiff file.")
+    raise gr.Error("Custom mode requires at least one .tif, .tiff, .png, .jpg, or .jpeg image.")
 
 
 def _execute_cpu_tools_over_mcp(
@@ -575,7 +607,7 @@ def _execute_cpu_tools_over_mcp(
     run_dir: Path,
     attempt: int,
 ) -> tuple[list[dict], bool, list[str], str, list[str]]:
-    """Execute a constrained CPU tool chain over uploaded or bundled rasters."""
+    """Execute a constrained CPU/GPU tool chain through the active MCP runtime."""
     trajectory = []
     artifacts: list[str] = []
     roles = infer_band_roles(raster_paths)
@@ -586,13 +618,82 @@ def _execute_cpu_tools_over_mcp(
     last_labels: list[str] = []
     trend_x: list[float] = []
     last_index_kind = ""
+    last_perception_result: dict | list | str | None = None
+
+    def selected_image(parameters: dict, position: int = 0) -> str:
+        requested = str(
+            parameters.get("image")
+            or parameters.get("image_path")
+            or parameters.get("input_image_path")
+            or ""
+        ).strip()
+        if requested:
+            match = next(
+                (path for path in raster_paths if Path(path).name == Path(requested).name),
+                None,
+            )
+            if match:
+                return match
+        if position >= len(raster_paths):
+            raise ValueError("This perception tool needs more input images.")
+        return raster_paths[position]
 
     for index, step in enumerate(plan):
         tool = step["tool"]
         parameters = dict(step.get("parameters", {}))
         status = "success"
         try:
-            if tool in {"inspect_rasters", "get_filelist"}:
+            if tool in GPU_SUPPORTED_TOOLS:
+                if tool == "remoteclip_classify":
+                    arguments = {"input_image_path": selected_image(parameters)}
+                elif tool == "sam2_segment":
+                    bbox = parameters.get("bbox")
+                    if not isinstance(bbox, list) or len(bbox) != 4:
+                        raise ValueError("sam2_segment requires bbox=[x, y, width, height].")
+                    arguments = {
+                        "input_image_path": selected_image(parameters),
+                        "bbox": bbox,
+                        "output_path": f"attempt_{attempt}_sam2_mask.png",
+                    }
+                elif tool in {"earthbench_change_detection", "earthbench_damage_assessment"}:
+                    arguments = {
+                        "pre_image_path": selected_image(parameters, 0),
+                        "post_image_path": selected_image(parameters, 1),
+                        "output_path": (
+                            f"attempt_{attempt}_changeos.png"
+                            if tool == "earthbench_change_detection"
+                            else f"attempt_{attempt}_bright_damage.png"
+                        ),
+                    }
+                else:
+                    arguments = {"image": selected_image(parameters)}
+                    if tool in {"text_to_bbox", "object_detection", "count_given_object"}:
+                        arguments["text"] = str(
+                            parameters.get("text") or parameters.get("object") or step["purpose"]
+                        )
+                    if tool == "region_attribute_description":
+                        arguments["attribute"] = str(
+                            parameters.get("attribute") or step["purpose"]
+                        )
+                    if parameters.get("bbox") is not None and tool in {
+                        "region_attribute_description", "count_given_object"
+                    }:
+                        bbox = parameters["bbox"]
+                        arguments["bbox"] = (
+                            str(bbox) if isinstance(bbox, str)
+                            else "(" + ", ".join(str(value) for value in bbox) + ")"
+                        )
+                last_perception_result = call_workflow_tool(tool, arguments)
+                observation = json.dumps(last_perception_result, ensure_ascii=False, default=str)
+                parameters = {
+                    key: Path(value).name if key.endswith("path") and isinstance(value, str) else value
+                    for key, value in arguments.items()
+                }
+                if isinstance(last_perception_result, dict):
+                    output_candidate = last_perception_result.get("output_path")
+                    if output_candidate and Path(output_candidate).is_file():
+                        artifacts.append(str(Path(output_candidate).resolve()))
+            elif tool in {"inspect_rasters", "get_filelist"}:
                 result = inspect_rasters(raster_paths)
                 observation = json.dumps(
                     {"count": len(result), "sample": result[:6], "truncated": len(result) > 6},
@@ -863,7 +964,7 @@ def _execute_cpu_tools_over_mcp(
                 validation = mcp_validate_result(raster_paths, artifacts)
                 observation = f"Validated {validation['checked']} readable input/result raster(s)."
             else:
-                raise ValueError(f"Unsupported CPU tool: {tool}")
+                raise ValueError(f"Unsupported MCP tool: {tool}")
         except Exception as exc:
             status = "error"
             observation = str(exc)
@@ -889,7 +990,7 @@ def _execute_cpu_tools_over_mcp(
         trajectory,
         True,
         [],
-        f"The real CPU tool chain completed and produced {len(artifacts)} downloadable artifact(s).",
+        f"The real MCP tool chain completed and produced {len(artifacts)} downloadable artifact(s).",
         artifacts,
     )
 
@@ -900,7 +1001,7 @@ def execute_cpu_tools(
     run_dir: Path,
     attempt: int,
 ) -> tuple[list[dict], bool, list[str], str, list[str]]:
-    """Run the full CPU chain through four discovered stdio MCP servers."""
+    """Run the full tool chain through discovered stdio MCP servers."""
     with workflow_mcp(run_dir):
         return _execute_cpu_tools_over_mcp(plan, raster_paths, run_dir, attempt)
 
@@ -1162,7 +1263,7 @@ def run_rsmem_loop(
 
     final_success = attempts[-1]["critic"]["success"]
     trace = {
-        "mode": "real CPU raster tool execution; GPU perception tools disabled",
+        "mode": "real MCP execution with health-gated CPU and GPU tools",
         "data_source": data_source,
         "query": query,
         "retrieved_domains": [
@@ -1197,8 +1298,8 @@ def run_rsmem_loop(
         f"**Attempts executed:** {len(attempts)}  \n"
         f"**Input source:** {data_source}  \n"
         f"**Final result:** {attempts[-1]['result']}\n\n"
-        "The observations above come from real CPU raster operations. GPU-backed visual perception "
-        "services remain intentionally disabled in this free-CPU deployment."
+        "The observations above come from real MCP tool calls. GPU perception is offered only when "
+        "the corresponding xGPU worker passes its health check."
     )
     api_status = f"🟢 API planner active · model: `{model}` · no preset fallback"
     return (
@@ -1255,18 +1356,57 @@ def _reflection_trace(attempt: dict) -> list[dict]:
 def _execute_interactive_attempt_steps(state: dict, api_key: str):
     attempt_number = len(state["attempts"]) + 1
     memory = state["memory"][-1]["reflection"] if state["memory"] else ""
-    yield "plan", "Planning an evidence-grounded tool chain with the selected model."
-    plan = plan_toolchain(
-        state["query"], state["knowledge_context"], memory,
-        api_key, state["base_url"], state["model"],
+    yield "plan", "Selecting the next action from the current evidence."
+    attempt_dir = Path(state["run_dir"]) / f"attempt_{attempt_number}"
+    react_result = run_react_attempt(
+        query=state["query"],
+        raster_paths=state["raster_paths"],
+        output_dir=attempt_dir,
+        api_key=api_key,
+        base_url=state["base_url"],
+        model=state["model"],
+        knowledge_context=state["knowledge_context"],
+        failure_memory=memory,
+        # Each RSMeM attempt gets its own checkpoint namespace. Cross-attempt
+        # learning is carried only by the user-confirmed FAM reflection, not by
+        # silently replaying the complete previous transcript.
+        thread_id=f"{state['agent_thread_id']}:attempt:{attempt_number}",
+        checkpoint_path=Path(state["checkpoint_path"]),
+    )
+    total_model_calls = react_result["model_calls"]
+
+    def budgeted_api_completion(*args, **kwargs):
+        nonlocal total_model_calls
+        if total_model_calls >= MAX_MODEL_CALLS_PER_ATTEMPT:
+            raise RuntimeError(
+                f"Attempt reached the {MAX_MODEL_CALLS_PER_ATTEMPT}-model-call budget."
+            )
+        total_model_calls += 1
+        return api_completion(*args, **kwargs)
+    plan = react_result["tool_plan"]
+    trajectory = react_result["trajectory"]
+    answer = react_result["answer"]
+    artifacts = react_result["artifacts"]
+    executor_success = bool(trajectory) and all(
+        step.get("status") == "success" for step in trajectory
+    )
+    executor_reasons = [
+        str(step.get("observation", ""))
+        for step in trajectory if step.get("status") != "success"
+    ]
+    executor_result = (
+        f"ReAct completed with {react_result['model_calls']} model call(s) and "
+        f"{len(trajectory)} MCP tool call(s)."
     )
     _trace_event(
         state, "plan",
-        f"Planner returned {len(plan)} step(s): " + ", ".join(step["tool"] for step in plan),
+        f"ReAct selected {len(plan)} tool call(s): "
+        + ", ".join(step["tool"] for step in plan),
+        model_calls=react_result["model_calls"],
+        mcp_health=react_result["mcp_health"],
     )
-    yield "execute", f"Executing {len(plan)} planned raster-tool step(s) on the real inputs."
-    trajectory, executor_success, executor_reasons, executor_result, artifacts = execute_cpu_tools(
-        plan, state["raster_paths"], Path(state["run_dir"]), attempt_number
+    yield "execute", (
+        f"ReAct executed {len(trajectory)} MCP call(s), observing each result before its next action."
     )
     _trace_event(
         state, "execute",
@@ -1284,13 +1424,7 @@ def _execute_interactive_attempt_steps(state: dict, api_key: str):
             for step in trajectory
         ],
     )
-    yield "answer", "Synthesizing the answer from verified tool observations."
-    answer = synthesize_answer(
-        api_call=api_completion, api_key=api_key,
-        base_url=state["base_url"], model=state["model"],
-        query=state["query"], trajectory=trajectory,
-        execution_result=executor_result,
-    )
+    yield "answer", "The ReAct agent produced its final answer from the observed MCP evidence."
 
     yield "evaluate", (
         "Comparing the result with the case reference."
@@ -1298,16 +1432,21 @@ def _execute_interactive_attempt_steps(state: dict, api_key: str):
         else "Running the Teacher Failure Gate; the user remains the final judge."
     )
     if state["mode"] == "case":
-        evaluation = judge_builtin_case(
-            api_call=api_completion, api_key=api_key,
-            base_url=state["base_url"], model=state["model"],
-            query=state["query"], reference=state["reference"],
-            trajectory=trajectory, final_answer=answer,
+        evaluation = evaluate_case_deterministically(
+            state["case_id"], trajectory, answer
         )
+        if evaluation is None:
+            evaluation = judge_builtin_case(
+                api_call=budgeted_api_completion, api_key=api_key,
+                base_url=state["base_url"], model=state["model"],
+                query=state["query"], reference=state["reference"],
+                trajectory=trajectory, final_answer=answer,
+            )
+            evaluation["source"] = "llm_judge"
         correct = evaluation["verdict"] == "correct"
     else:
         evaluation = teacher_failure_gate(
-            api_call=api_completion, api_key=api_key,
+            api_call=budgeted_api_completion, api_key=api_key,
             base_url=state["base_url"], model=state["model"],
             query=state["query"], trajectory=trajectory, final_answer=answer,
         )
@@ -1326,6 +1465,8 @@ def _execute_interactive_attempt_steps(state: dict, api_key: str):
             },
             "answer": answer,
             "evaluation": evaluation,
+            "model_calls": total_model_calls,
+            "checkpoint_path": react_result["checkpoint_path"],
         }
     )
     state["artifacts"] = sorted(set(state["artifacts"] + artifacts))
@@ -1343,7 +1484,7 @@ def _execute_interactive_attempt_steps(state: dict, api_key: str):
             state["status"] = "max_attempts_reached"
         else:
             state["candidates"] = generate_reflection_candidates(
-                api_call=api_completion, api_key=api_key,
+                api_call=budgeted_api_completion, api_key=api_key,
                 base_url=state["base_url"], model=state["model"],
                 query=state["query"], knowledge_context=state["knowledge_context"],
                 trajectory=_reflection_trace(state["attempts"][-1]),
@@ -1357,6 +1498,7 @@ def _execute_interactive_attempt_steps(state: dict, api_key: str):
                 ),
             )
             state["status"] = "awaiting_reflection"
+            state["attempts"][-1]["model_calls"] = total_model_calls
     else:
         state["status"] = (
             "max_attempts_reached"
@@ -1369,8 +1511,8 @@ def _execute_interactive_attempt_steps(state: dict, api_key: str):
 PHASE_LABELS = {
     "start": "initialization",
     "retrieve": "knowledge retrieval",
-    "plan": "tool-chain planning",
-    "execute": "tool execution",
+    "plan": "ReAct reasoning and tool selection",
+    "execute": "MCP action and observation",
     "answer": "answer synthesis",
     "evaluate": "evaluation",
     "reflect": "reflection generation",
@@ -1425,29 +1567,29 @@ def _execute_interactive_attempt(state: dict, api_key: str) -> dict:
 def _processing_timeline(active_phase: str, detail: str) -> str:
     stages = [
         ("retrieve", "Retrieve", "domain knowledge"),
-        ("plan", "Plan", "tool chain"),
-        ("execute", "Execute", "CPU raster tools"),
+        ("agent", "ReAct agent loop", "reason ↔ tool call ↔ observation"),
         ("answer", "Answer", "evidence synthesis"),
         ("evaluate", "Evaluate", "judge or failure gate"),
     ]
     order = [item[0] for item in stages]
-    active_index = order.index(active_phase) if active_phase in order else len(order)
+    display_phase = "agent" if active_phase in {"plan", "execute"} else active_phase
+    active_index = order.index(display_phase) if display_phase in order else len(order)
     cards = []
     for index, (key, name, caption) in enumerate(stages, start=1):
-        state_class = "done" if index - 1 < active_index else "current" if key == active_phase else "pending"
+        state_class = "done" if index - 1 < active_index else "current" if key == display_phase else "pending"
         cards.append(
             f'<div class="stage {state_class}"><span>{index}</span><b>{name}</b><small>{caption}</small></div>'
         )
     return (
         '<div class="run-progress-panel">'
         '<div class="run-progress-heading"><span class="run-pulse"></span>'
-        '<div><b>RSMeM is working</b><small>' + detail + '</small></div></div>'
+        '<div><b>RSMeM is working</b></div></div>'
         '<div class="pipeline processing-pipeline">' + "".join(cards) + '</div></div>'
     )
 
 
 def _stream_update(state: dict, phase: str, detail: str):
-    status = f"### RSMeM is working\n\n{detail}"
+    status = gr.update(value="", visible=False)
     return (state, status, _processing_timeline(phase, detail), *[gr.skip() for _ in range(18)])
 
 
@@ -1490,7 +1632,8 @@ def _initialize_interactive_workflow(
     model = requested_model.strip() or DEFAULT_MODEL
     if not example_name and not uploaded_files:
         raise gr.Error(
-            "Attach GeoTIFF files for your own task, or load one of the prepared examples."
+            "Attach GeoTIFF, PNG, or JPEG remote-sensing images for your own task, "
+            "or load one of the prepared examples."
         )
     example = EXAMPLES.get(example_name) if example_name else {
         "directory": None,
@@ -1517,6 +1660,9 @@ def _initialize_interactive_workflow(
         "knowledge_context": hkg_context,
         "retrieved": retrieved,
         "reference": reference,
+        "case_id": None if custom else example["directory"],
+        "agent_thread_id": secrets.token_hex(16),
+        "checkpoint_path": str(run_dir / "react_checkpoints.sqlite"),
         "attempts": [],
         "memory": [],
         "candidates": {},
@@ -1595,8 +1741,7 @@ def _attempts_interactive_html(state: dict) -> str:
     sections = []
     for attempt in state.get("attempts", []):
         plan_items = "".join(
-            f'<li><code>{_esc(step["tool"])}</code>'
-            f'<span class="why">{_esc(step.get("purpose", ""))}</span></li>'
+            f'<li><code>{_esc(step["tool"])}</code></li>'
             for step in attempt["tool_plan"]
         )
         step_cards = []
@@ -1608,26 +1753,19 @@ def _attempts_interactive_html(state: dict) -> str:
                 else '<span class="badge err">error</span>'
             )
             step_cards.append(
-                '<details class="step-card" open>'
+                '<details class="step-card">'
                 f'<summary><span class="num">{_esc(step["step"])}</span>'
                 f'<code>{_esc(step["tool"])}</code>{badge}</summary>'
                 f'<div class="step-obs">{_esc(step["observation"])}</div>'
                 "</details>"
             )
-        context_line = (
-            f"Context: HKG = {'yes' if attempt['context'].get('hkg') else 'no'} · "
-            f"selected FAM = {'yes' if attempt['context']['far_memory'] else 'no'}"
-        )
         sections.append(
             '<div class="trace-attempt">'
             f'<div class="attempt-head">Attempt {_esc(attempt["attempt"])}</div>'
-            f'<div class="ctx-line">{_esc(context_line)}</div>'
-            '<div class="block-label">Planned tool chain</div>'
+            '<div class="block-label">Tool calls</div>'
             f'<ol class="plan">{plan_items}</ol>'
-            '<div class="block-label">Real execution trajectory</div>'
+            '<div class="block-label">Observation</div>'
             f"{''.join(step_cards)}"
-            '<div class="block-label">Answer synthesized from tool evidence</div>'
-            f'<div class="attempt-answer">{_esc(attempt["answer"])}</div>'
             "</div>"
         )
     joined = '<hr class="trace-divider">'.join(sections)
@@ -1664,7 +1802,7 @@ def _interactive_timeline(state: dict) -> str:
     def stage_state(name: str) -> str:
         if name == "retrieve":
             return "done" if has_knowledge else "skip"
-        if name in {"plan", "execute", "answer", "evaluate"}:
+        if name in {"react", "answer", "evaluate"}:
             return "done" if has_attempt else "pending"
         if name == "human":
             if status == "awaiting_user_decision":
@@ -1684,12 +1822,11 @@ def _interactive_timeline(state: dict) -> str:
 
     stages = [
         ("1", "Retrieve", "relevant knowledge" if has_knowledge else "skipped: no relevant match", "retrieve"),
-        ("2", "Plan", "LLM tool chain", "plan"),
-        ("3", "Execute", "real CPU tools", "execute"),
-        ("4", "Answer", "evidence synthesis", "answer"),
-        ("5", "Evaluate", "case judge or teacher gate", "evaluate"),
-        ("6", "Human", "accept or request retry", "human"),
-        ("7", "Reflect", "repair and evolve memory", "reflect"),
+        ("2", "ReAct agent loop", "reason ↔ tool call ↔ observation", "react"),
+        ("3", "Answer", "evidence synthesis", "answer"),
+        ("4", "Evaluate", "case judge or teacher gate", "evaluate"),
+        ("5", "Human", "accept or request retry", "human"),
+        ("6", "Reflect", "repair and evolve memory", "reflect"),
     ]
     cards = "".join(
         f'<div class="stage {stage_state(key)}"><span>{n}</span><b>{name}</b><small>{detail}</small></div>'
@@ -1744,7 +1881,7 @@ def _evaluation_summary_markdown(evaluation: dict, mode: str) -> str:
         )
         if verdict != "correct" and evaluation.get("comparison"):
             message += f"\n\n**Reason:** {str(evaluation['comparison']).strip()}"
-        return f"### {title}\n\n{message}\n\n{confidence_line}"
+        return f"#### {title}\n\n{message}\n\n{confidence_line}"
 
     retry = bool(evaluation.get("retry"))
     if retry:
@@ -1759,7 +1896,7 @@ def _evaluation_summary_markdown(evaluation: dict, mode: str) -> str:
     else:
         title = "⚠️ Automated check is uncertain"
         message = "Please inspect the result and decide whether another attempt is needed."
-    return f"### {title}\n\n{message}\n\n{confidence_line}"
+    return f"#### {title}\n\n{message}\n\n{confidence_line}"
 
 
 def _render_interactive_state(state: dict):
@@ -1796,10 +1933,12 @@ def _render_interactive_state(state: dict):
     show_knowledge = bool(state.get("knowledge_markdown", "").strip())
     candidate_1, candidate_2, candidate_3 = _reflection_candidate_texts(state)
     final_answer = latest.get("answer", "")
+    evaluation_md = _evaluation_summary_markdown(evaluation, state.get("mode", "case"))
     final_md = (
-        f"### Task\n\n{state.get('query', '')}\n\n"
+        f"### User query\n\n{state.get('query', '')}\n\n"
         f"### Current result\n\n{final_answer}\n\n"
-        f"**Data source:** {state.get('data_source', '')}"
+        f"**Data source:** {state.get('data_source', '')}\n\n"
+        f"### Evaluator assessment\n\n{evaluation_md}"
     )
     return (
         status_md,
@@ -1841,9 +1980,20 @@ def request_custom_reflections(state: dict, user_api_key: str):
         raise gr.Error("API key is required to generate reflection candidates.")
     updated = copy.deepcopy(state)
     latest = updated["attempts"][-1]
+    total_model_calls = int(latest.get("model_calls", 0))
+
+    def budgeted_api_completion(*args, **kwargs):
+        nonlocal total_model_calls
+        if total_model_calls >= MAX_MODEL_CALLS_PER_ATTEMPT:
+            raise RuntimeError(
+                f"Attempt reached the {MAX_MODEL_CALLS_PER_ATTEMPT}-model-call budget."
+            )
+        total_model_calls += 1
+        return api_completion(*args, **kwargs)
+
     try:
         updated["candidates"] = generate_reflection_candidates(
-            api_call=api_completion, api_key=api_key,
+            api_call=budgeted_api_completion, api_key=api_key,
             base_url=updated["base_url"], model=updated["model"],
             query=updated["query"], knowledge_context=updated["knowledge_context"],
             trajectory=_reflection_trace(latest), ftro_builder=_ftro_candidate_view,
@@ -1855,6 +2005,7 @@ def request_custom_reflections(state: dict, user_api_key: str):
         )
         _write_debug_trace(updated)
         raise gr.Error(f"Reflection generation failed: {exc}") from exc
+    latest["model_calls"] = total_model_calls
     _trace_event(
         updated, "reflect",
         "Reflection candidates: " + ", ".join(
@@ -2197,8 +2348,8 @@ CSS = """
 .run-progress-heading small {display:block; margin-top:3px; font-size:12px; color:#686868;}
 .run-pulse {width:12px; height:12px; border-radius:50%; background:#242424; box-shadow:0 0 0 0 rgba(36,36,36,.25); animation:rsmem-pulse 1.35s infinite; flex:none;}
 @keyframes rsmem-pulse {0%{box-shadow:0 0 0 0 rgba(36,36,36,.28)}70%{box-shadow:0 0 0 10px rgba(36,36,36,0)}100%{box-shadow:0 0 0 0 rgba(36,36,36,0)}}
-.processing-pipeline {grid-template-columns:repeat(5,minmax(112px,1fr)) !important; margin-bottom:0 !important;}
-.pipeline {display:grid; grid-template-columns:repeat(7,minmax(100px,1fr)); gap:7px; margin:10px 0 11px;}
+.processing-pipeline {grid-template-columns:repeat(4,minmax(132px,1fr)) !important; margin-bottom:0 !important;}
+.pipeline {display:grid; grid-template-columns:repeat(6,minmax(108px,1fr)); gap:7px; margin:10px 0 11px;}
 .stage {min-width:0; border-radius:9px; padding:9px 10px; border:1px solid #e2e2e2; background:#ffffff; color:#262626;}
 .stage span {display:inline-flex; width:20px; height:20px; border-radius:50%; align-items:center; justify-content:center; margin-right:6px; background:#ededed; color:#555555; font-size:11px;}
 .stage b {display:inline-block; font-size:12px;}
@@ -2224,14 +2375,12 @@ CSS = """
 /* Agent trace */
 .agent-trace {font-size:13px; line-height:1.55;}
 .agent-trace .attempt-head {font-size:14px; font-weight:700; margin:2px 0 4px;}
-.agent-trace .ctx-line {font-size:12px; color:#737373; margin-bottom:10px;}
 .agent-trace .block-label {font-size:13px; font-weight:650; margin:14px 0 8px;}
 .agent-trace ol.plan {list-style:none; margin:0; padding:0; counter-reset:plan;}
 .agent-trace ol.plan li {counter-increment:plan; display:flex; gap:10px; padding:6px 0; border-bottom:1px dashed #eeeeee; align-items:baseline;}
 .agent-trace ol.plan li:last-child {border-bottom:0;}
 .agent-trace ol.plan li::before {content:counter(plan); flex:none; width:20px; height:20px; border-radius:50%; background:#ededed; color:#555555; font-size:11px; display:inline-flex; align-items:center; justify-content:center; position:relative; top:3px;}
 .agent-trace ol.plan code {font-family:ui-monospace,Menlo,monospace; font-size:12px; background:#f0f0f0; border-radius:4px; padding:1px 6px; white-space:nowrap;}
-.agent-trace ol.plan .why {color:#737373;}
 .agent-trace .step-card {border:1px solid #e3e3e3; border-radius:10px; margin-bottom:8px; background:#ffffff; overflow:hidden;}
 .agent-trace .step-card summary {display:flex; align-items:center; gap:10px; padding:8px 12px; cursor:pointer; list-style:none;}
 .agent-trace .step-card summary::-webkit-details-marker {display:none;}
@@ -2244,9 +2393,10 @@ CSS = """
 .agent-trace .attempt-answer {border:1px solid #e6e6e6; border-radius:10px; background:#fbfbfb; padding:10px 14px; white-space:pre-wrap;}
 .agent-trace .trace-divider {border:0; border-top:1px solid #e3e3e3; margin:18px 0;}
 
-/* Final answer card */
+/* Summary card */
 #current-result {border:1px solid #e3e3e3 !important; border-left:3px solid #202020 !important; background:#fbfbfb !important; border-radius:0 10px 10px 0 !important; padding:12px 16px !important; margin-top:14px;}
 #current-result h3 {font-size:13px !important; margin:0 0 4px !important;}
+#current-result h4 {font-size:13.5px !important; margin:8px 0 4px !important;}
 
 /* Evidence */
 #evaluation-card {background:#ffffff !important; border:1px solid #e3e3e3 !important; border-radius:10px !important; padding:12px 14px !important; margin-top:10px;}
@@ -2283,9 +2433,7 @@ footer {visibility:hidden; height:0;}
 
 with gr.Blocks(title=PROJECT_TITLE) as demo:
     gr.HTML(
-        "<div class='hero'><h1>🛰️ RSMeM — A real end-to-end Earth-observation analysis agent</h1>"
-        "<p>From raw GeoTIFFs to verified answers — geoscience-knowledge planning, "
-        "100+ real raster tools, downloadable evidence, self-evolving failure-aware memory.</p></div>"
+        "<div class='hero'><h1>🛰️ RSMeM — A real end-to-end Earth-observation analysis agent</h1></div>"
     )
 
     with gr.Tab("Run RSMeM"):
@@ -2295,7 +2443,7 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
         with gr.Group(elem_id="input-card"):
             gr.Markdown(
                 "### What do you want RSMeM to analyze?\n"
-                "Write your own task and attach GeoTIFFs, or load a prepared case below.",
+                "Write your own task and attach GeoTIFF, TIFF, PNG, or JPEG imagery, or load a prepared case below.",
                 elem_classes=["card-heading"],
             )
             query_input = gr.Textbox(
@@ -2312,14 +2460,14 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
             with gr.Row(elem_id="attach-row"):
                 with gr.Column(scale=6, min_width=280):
                     gr.Markdown(
-                        "**Attach GeoTIFF files** · `.tif` / `.tiff` · multiple files "
+                        "**Attach your imagery** · GeoTIFF, TIFF, PNG, or JPEG · multiple files "
                         "and multiband rasters supported",
                         elem_classes=["upload-heading"],
                     )
                     raster_input = gr.File(
                         show_label=False,
                         file_count="multiple",
-                        file_types=[".tif", ".tiff"],
+                        file_types=[".tif", ".tiff", ".png", ".jpg", ".jpeg"],
                         type="filepath",
                         elem_id="raster-upload",
                         height=170,
@@ -2424,10 +2572,9 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
 
         with gr.Column(visible=False, elem_id="rsmem-workspace") as workspace_group:
             gr.Markdown(
-                "## Agent trace\nThe plan, real MCP tool calls, and evidence-grounded answer.",
+                "## Summary",
                 elem_classes=["section-title"],
             )
-            attempts_output = gr.HTML(elem_id="agent-trace-body")
             final_output = gr.Markdown(
                 "Run an example or upload your own rasters to see the result.",
                 elem_id="current-result",
@@ -2435,15 +2582,21 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
             )
 
             gr.Markdown(
-                "## Evidence & artifacts\nKnowledge, evaluation, and generated files.",
+                "## Agent trace",
+                elem_classes=["section-title"],
+            )
+            attempts_output = gr.HTML(elem_id="agent-trace-body")
+
+            gr.Markdown(
+                "## Evidence & artifacts\nRetrieved knowledge and generated files.",
                 elem_classes=["section-title"],
             )
             with gr.Accordion("Retrieved knowledge", open=True) as hkg_accordion:
                 hkg_output = gr.Markdown(elem_classes=["workspace-content"])
-            evaluation_output = gr.Markdown(elem_id="evaluation-card")
+            evaluation_output = gr.Markdown(visible=False, elem_id="evaluation-card")
             with gr.Accordion("Generated files", open=True):
                 artifact_output = gr.File(
-                    label="Download derived GeoTIFF artifacts", file_count="multiple"
+                    label="Download generated artifacts", file_count="multiple"
                 )
             with gr.Accordion("Debug trace", open=True):
                 gr.Markdown(

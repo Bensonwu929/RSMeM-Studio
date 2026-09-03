@@ -198,7 +198,7 @@ class DebugTraceTests(unittest.TestCase):
             with self.assertRaises(Exception) as ctx:
                 for outputs in stream:
                     pass
-        self.assertIn("tool-chain planning", str(ctx.exception))
+        self.assertIn("ReAct reasoning and tool selection", str(ctx.exception))
         self.assertTrue(any(e.get("traceback") for e in state["debug_trace"]))
 
     def test_attempt_error_is_stage_tagged_for_non_stream_paths(self):
