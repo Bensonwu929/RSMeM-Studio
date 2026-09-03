@@ -163,7 +163,6 @@ export MODELSCOPE_API_TOKEN=...  # configure as a ModelScope Studio secret
 python scripts/prepare_xgpu_workspace.py --download-deployment-bundle
 python scripts/prepare_xgpu_workspace.py --bootstrap-envs
 python scripts/prepare_xgpu_workspace.py  # validates every required asset
-pip install -r requirements-xgpu.txt
 ```
 
 `snapshot_download()` is guarded by exact-file validation and an inter-process
@@ -173,28 +172,31 @@ deployment bundle defaults to
 `wbx929/RSMeM-Perception-Models` and can be overridden with
 `RSMEM_MODELSCOPE_MODEL_REPO`.
 
-The environment bootstrap is also persistent and lock-protected. It creates
-three isolated Python 3.10 prefixes (`earthbench`, `oea-e1`, and `oea-e3`) under
-`/mnt/workspace/envs`; subsequent Studio restarts reuse their completion markers.
-Set `RSMEM_CONDA_EXE` only when `conda`, `mamba`, or `micromamba` is not already
-on `PATH`. `RSMEM_GPU_BOOTSTRAP_ENVS=0` disables automatic environment creation.
+The same private repository contains a minimal source archive, EasyOCR weights,
+and six relocatable conda-pack archives. Bootstrap preserves the validated QY_11
+environment boundaries: separate Python 3.10 prefixes for `sam2`, `remoteclip`,
+`changeos`, and `bright`, plus OEA's original `oea-e1` and `oea-e3` split under
+`/mnt/workspace/envs`; it never runs Git, conda, or pip and never contacts
+GitHub, Hugging Face, PyPI, or Anaconda. Subsequent Studio restarts reuse
+checksum-backed completion markers. `RSMEM_GPU_BOOTSTRAP_ENVS=0` disables
+automatic environment extraction.
 
-After cloning the public sources, the bootstrap applies three small,
+After extracting the packaged sources, the bootstrap applies three small,
 version-controlled worker fixes from [`xgpu_workers/`](xgpu_workers/README.md).
 These are the same ChangeOS preprocessing, LAE-DINO/BERT compatibility, and
 safe-registration versions exercised on QY_11; no model implementation is
 replaced by a mock or placeholder.
 
-The second command reports the remaining EarthBench, Grounding-DINO, and
-LAE-DINO checkpoints that must be copied into `/mnt/workspace/models`. Configure
-separate Python interpreters when OEA's E1/E3 dependencies cannot coexist:
+All checkpoints, sources, OCR assets, and worker environments are downloaded as
+one versioned ModelScope bundle. Configure separate Python interpreters only
+when overriding the packaged defaults:
 
 ```bash
 export RSMEM_GPU_AUTOSTART=1
 export RSMEM_ENABLE_GPU_PERCEPTION=1
 export RSMEM_OEA_E1_PYTHON=/mnt/workspace/envs/oea-e1/bin/python
 export RSMEM_OEA_E3_PYTHON=/mnt/workspace/envs/oea-e3/bin/python
-export RSMEM_EARTHBENCH_PYTHON=/mnt/workspace/envs/earthbench/bin/python
+export RSMEM_EARTHBENCH_PYTHON=/mnt/workspace/envs/sam2/bin/python
 ```
 
 Optional `RSMEM_GPU_SERVICES` is a comma-separated allowlist of service names

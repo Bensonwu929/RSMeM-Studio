@@ -1,12 +1,47 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import sys
+import tarfile
 from pathlib import Path
 
 import gpu_service_manager as manager
 import model_assets
 import xgpu_runtime
+
+
+def _write_offline_bundles(models: Path) -> None:
+    checksums = []
+    for relative in model_assets.OFFLINE_BUNDLE_FILES:
+        path = models / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(relative.encode("utf-8"))
+        checksums.append(f"{model_assets._sha256(path)}  {path.name}")
+    manifest = models / model_assets.OFFLINE_CHECKSUMS
+    manifest.write_text("\n".join(checksums) + "\n", encoding="utf-8")
+    model_assets._verify_offline_bundles(models)
+
+
+def _mark_source_ready(workspace: Path, models: Path) -> None:
+    archive = models / "offline" / "rsmem-perception-sources-v1.tar.gz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "w:gz"):
+        pass
+    required = (
+        workspace / "RSMeM-public" / "tools" / "deploy_tools" / "sam2_api.py",
+        workspace / "OpenEarthAgent" / "tool_server" / "tool_workers" / "online_workers" / "controller.py",
+        workspace / "OpenEarthAgent" / "tool_server" / "utils" / "server_utils.py",
+        models / "GroundingDINO" / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py",
+        models / "LAE-DINO" / "mmdetection_lae" / "__init__.py",
+        workspace / "easyocr" / "model" / "craft_mlt_25k.pth",
+    )
+    for path in required:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    marker = workspace / ".rsmem-source-bundle.json"
+    marker.write_text(json.dumps({"sha256": model_assets._sha256(archive)}), encoding="utf-8")
 
 
 def _load_perception(tmp_path: Path, monkeypatch):
@@ -74,14 +109,18 @@ def test_asset_validation_uses_exact_qy11_sizes(tmp_path):
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("wb") as handle:
             handle.truncate(size)
+    _write_offline_bundles(tmp_path)
     assert model_assets.assets_ready(tmp_path)
     (tmp_path / "Qwen3-VL-8B-Instruct" / "config.json").write_bytes(b"short")
     assert not model_assets.assets_ready(tmp_path)
 
 
-def test_runtime_environment_maps_shared_earthbench_and_isolated_oea(tmp_path, monkeypatch):
+def test_runtime_environment_preserves_qy11_isolation_boundaries(tmp_path, monkeypatch):
     interpreters = {
-        "earthbench": tmp_path / "earth" / "python",
+        "sam2": tmp_path / "sam2" / "python",
+        "remoteclip": tmp_path / "remoteclip" / "python",
+        "changeos": tmp_path / "changeos" / "python",
+        "bright": tmp_path / "bright" / "python",
         "oea-e1": tmp_path / "e1" / "python",
         "oea-e3": tmp_path / "e3" / "python",
     }
@@ -92,7 +131,10 @@ def test_runtime_environment_maps_shared_earthbench_and_isolated_oea(tmp_path, m
     ):
         monkeypatch.delenv(variable, raising=False)
     xgpu_runtime.configure_runtime_environment(interpreters)
-    assert manager.service_specs()[0].command[0] == str(interpreters["earthbench"])
+    assert manager.service_specs()[0].command[0] == str(interpreters["sam2"])
+    assert manager.service_specs()[1].command[0] == str(interpreters["remoteclip"])
+    assert manager.service_specs()[2].command[0] == str(interpreters["changeos"])
+    assert manager.service_specs()[3].command[0] == str(interpreters["bright"])
     assert manager.service_specs()[4].command[0] == str(interpreters["oea-e1"])
     assert manager.service_specs()[6].command[0] == str(interpreters["oea-e3"])
 
@@ -111,7 +153,7 @@ def test_lae_config_rewrites_qy11_bert_path(tmp_path, monkeypatch):
     )
     config.parent.mkdir(parents=True)
     config.write_text("lang_model_name = '/server-only/bert'\nother = 1\n", encoding="utf-8")
-    monkeypatch.setattr(model_assets, "_clone_once", lambda *_args: None)
+    _mark_source_ready(tmp_path, models)
     model_assets.ensure_source_trees(tmp_path, models)
     rewritten = config.read_text(encoding="utf-8")
     assert str(models / "bert-base-uncased") in rewritten
@@ -136,8 +178,73 @@ def test_tested_worker_overrides_replace_cloned_sources(tmp_path, monkeypatch):
     )
     lae.parent.mkdir(parents=True)
     lae.write_text("lang_model_name = '/old'\n", encoding="utf-8")
-    monkeypatch.setattr(model_assets, "_clone_once", lambda *_args: None)
+    _mark_source_ready(tmp_path, models)
     model_assets.ensure_source_trees(tmp_path, models)
     assert "_preprocess_pair" in targets[0].read_text(encoding="utf-8")
     assert "_patch_bert_sdpa_mask_utils" in targets[1].read_text(encoding="utf-8")
     assert targets[2].read_text(encoding="utf-8").index("self.init_model()") < targets[2].read_text(encoding="utf-8").index("self.register_to_controller()")
+
+
+def test_offline_runtime_extracts_without_conda_or_pip(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    models = workspace / "models"
+    checksums = []
+    for relative in xgpu_runtime.OFFLINE_ENV_ARCHIVES.values():
+        archive = models / relative
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, "w:gz") as bundle:
+            payload = b"#!/bin/sh\n"
+            info = tarfile.TarInfo("bin/python")
+            info.mode = 0o755
+            info.size = len(payload)
+            bundle.addfile(info, io.BytesIO(payload))
+        checksums.append(f"{xgpu_runtime._sha256(archive)}  {archive.name}")
+    (models / "offline" / "SHA256SUMS").write_text(
+        "\n".join(checksums) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(xgpu_runtime.subprocess, "run", lambda *args, **kwargs: None)
+    interpreters = xgpu_runtime.ensure_xgpu_runtime_envs(workspace, models)
+    assert set(interpreters) == {
+        "sam2", "remoteclip", "changeos", "bright", "oea-e1", "oea-e3"
+    }
+    assert all(path.is_file() for path in interpreters.values())
+    assert not any((models / relative).exists() for relative in xgpu_runtime.OFFLINE_ENV_ARCHIVES.values())
+
+
+def test_runtime_downloads_only_missing_archive_and_deletes_it(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    models = workspace / "models"
+    download_root = tmp_path / "remote"
+    checksums = []
+    for relative in xgpu_runtime.OFFLINE_ENV_ARCHIVES.values():
+        archive = download_root / relative
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, "w:gz") as bundle:
+            payload = b"#!/bin/sh\n"
+            info = tarfile.TarInfo("bin/python")
+            info.mode = 0o755
+            info.size = len(payload)
+            bundle.addfile(info, io.BytesIO(payload))
+        checksums.append(f"{xgpu_runtime._sha256(archive)}  {archive.name}")
+    (models / "offline").mkdir(parents=True)
+    (models / "offline" / "SHA256SUMS").write_text(
+        "\n".join(checksums) + "\n", encoding="utf-8"
+    )
+    downloaded = []
+
+    def fake_download(_models, relative, _workspace):
+        source = download_root / relative
+        target = workspace / ".rsmem-runtime-downloads" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+        downloaded.append(Path(relative).name)
+        return target
+
+    monkeypatch.setattr(xgpu_runtime, "_download_archive", fake_download)
+    monkeypatch.setattr(xgpu_runtime.subprocess, "run", lambda *args, **kwargs: None)
+    interpreters = xgpu_runtime.ensure_xgpu_runtime_envs(workspace, models)
+    assert downloaded == [Path(item).name for item in xgpu_runtime.OFFLINE_ENV_ARCHIVES.values()]
+    assert all(path.is_file() for path in interpreters.values())
+    assert not (workspace / ".rsmem-runtime-downloads" / "offline").exists() or not any(
+        (workspace / ".rsmem-runtime-downloads" / "offline").iterdir()
+    )

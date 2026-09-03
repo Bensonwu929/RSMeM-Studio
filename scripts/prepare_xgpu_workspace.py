@@ -7,7 +7,6 @@ needed, must be supplied through the platform's own environment/credential UI.
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from pathlib import Path
 
@@ -17,28 +16,18 @@ from model_assets import DEFAULT_REPO_ID, prepare_xgpu_assets
 from xgpu_runtime import configure_runtime_environment, ensure_xgpu_runtime_envs
 
 
-def clone(url: str, destination: Path) -> None:
-    if destination.is_dir():
-        print(f"present  {destination}")
-        return
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "clone", "--depth", "1", url, str(destination)], check=True)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", default="/mnt/workspace")
-    parser.add_argument("--clone-sources", action="store_true")
-    parser.add_argument("--download-qwen", action="store_true")
     parser.add_argument(
         "--bootstrap-envs",
         action="store_true",
-        help="create the persistent EarthBench and OEA Python 3.10 worker environments",
+        help="extract the packaged EarthBench and OEA Python 3.10 environments",
     )
     parser.add_argument(
         "--download-deployment-bundle",
         action="store_true",
-        help=f"download {DEFAULT_REPO_ID} and clone required public source trees",
+        help=f"download and verify the complete offline bundle from {DEFAULT_REPO_ID}",
     )
     args = parser.parse_args()
     root = Path(args.workspace).expanduser().resolve()
@@ -53,18 +42,6 @@ def main() -> int:
         configure_runtime_environment(interpreters)
         for name, python in interpreters.items():
             print(f"runtime  {name}: {python}")
-
-    if args.clone_sources:
-        clone("https://github.com/AI9Stars/RSMeM.git", root / "RSMeM-public")
-        clone("https://github.com/mbzuai-oryx/OpenEarthAgent.git", root / "OpenEarthAgent")
-
-    if args.download_qwen:
-        from modelscope import snapshot_download
-
-        snapshot_download(
-            "Qwen/Qwen3-VL-8B-Instruct",
-            local_dir=str(models / "Qwen3-VL-8B-Instruct"),
-        )
 
     required = [
         root / "RSMeM-public" / "tools" / "deploy_tools" / "remoteclip_api.py",

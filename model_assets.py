@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import json
 import os
 import shutil
-import subprocess
+import tarfile
 from pathlib import Path
 
 
@@ -35,12 +37,76 @@ EXPECTED_FILES = {
     "bert-base-uncased/vocab.txt": 231_508,
 }
 
+OFFLINE_BUNDLE_FILES = (
+    "offline/rsmem-perception-sources-v1.tar.gz",
+)
+OFFLINE_CHECKSUMS = "offline/SHA256SUMS"
+OFFLINE_VERIFIED_MARKER = ".rsmem-offline-assets.json"
+
 
 def assets_ready(models_dir: Path) -> bool:
-    return all(
+    weights_ready = all(
         (models_dir / relative).is_file()
         and (models_dir / relative).stat().st_size == expected_size
         for relative, expected_size in EXPECTED_FILES.items()
+    )
+    if not weights_ready:
+        return False
+    marker = models_dir / OFFLINE_VERIFIED_MARKER
+    checksums = models_dir / OFFLINE_CHECKSUMS
+    if not marker.is_file() or not checksums.is_file():
+        return False
+    try:
+        metadata = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if metadata.get("manifest_sha256") != _sha256(checksums):
+        return False
+    recorded = metadata.get("files", {})
+    return all(
+        (models_dir / relative).is_file()
+        and (models_dir / relative).stat().st_size == recorded.get(relative)
+        for relative in OFFLINE_BUNDLE_FILES
+    )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_offline_bundles(models_dir: Path) -> None:
+    checksum_path = models_dir / OFFLINE_CHECKSUMS
+    if not checksum_path.is_file():
+        raise RuntimeError(f"Offline checksum manifest is missing: {checksum_path}")
+    expected: dict[str, str] = {}
+    for line in checksum_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            checksum, filename = line.split(maxsplit=1)
+        except ValueError as exc:
+            raise RuntimeError(f"Malformed checksum manifest line: {line!r}") from exc
+        expected[f"offline/{filename.lstrip('*')}"] = checksum
+    missing = [item for item in OFFLINE_BUNDLE_FILES if item not in expected]
+    if missing:
+        raise RuntimeError("Offline checksum entries are missing: " + ", ".join(missing))
+    for relative in OFFLINE_BUNDLE_FILES:
+        path = models_dir / relative
+        if not path.is_file() or _sha256(path) != expected[relative]:
+            raise RuntimeError(f"Offline bundle checksum mismatch: {relative}")
+    metadata = {
+        "manifest_sha256": _sha256(checksum_path),
+        "files": {
+            relative: (models_dir / relative).stat().st_size
+            for relative in OFFLINE_BUNDLE_FILES
+        },
+    }
+    (models_dir / OFFLINE_VERIFIED_MARKER).write_text(
+        json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
 
 
@@ -68,7 +134,9 @@ def ensure_model_assets(models_dir: Path, workspace: Path) -> Path:
             local_dir=str(models_dir),
             token=token,
             max_workers=int(os.getenv("RSMEM_MODEL_DOWNLOAD_WORKERS", "4")),
+            ignore_file_pattern=["offline/*-py310-*.tar.gz"],
         )
+        _verify_offline_bundles(models_dir)
         if not assets_ready(models_dir):
             missing = [
                 relative
@@ -76,29 +144,49 @@ def ensure_model_assets(models_dir: Path, workspace: Path) -> Path:
                 if not (models_dir / relative).is_file()
                 or (models_dir / relative).stat().st_size != size
             ]
-            raise RuntimeError(
-                "Model repository download completed but validation failed: "
-                + ", ".join(missing)
-            )
+            raise RuntimeError("Model repository download completed but validation failed: " + ", ".join(missing))
     return models_dir
 
 
-def _clone_once(url: str, destination: Path) -> None:
-    if destination.is_dir():
-        return
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["git", "clone", "--depth", "1", url, str(destination)],
-        check=True,
-    )
+def _safe_extract(archive: Path, destination: Path) -> None:
+    root = destination.resolve()
+    with tarfile.open(archive, "r:gz") as bundle:
+        for member in bundle.getmembers():
+            target = (destination / member.name).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError(f"Unsafe path in source archive: {member.name}")
+        bundle.extractall(destination, filter="fully_trusted")
 
 
 def ensure_source_trees(workspace: Path, models_dir: Path) -> None:
-    """Clone public worker/config sources only on the first xGPU startup."""
-    _clone_once("https://github.com/AI9Stars/RSMeM.git", workspace / "RSMeM-public")
-    _clone_once("https://github.com/mbzuai-oryx/OpenEarthAgent.git", workspace / "OpenEarthAgent")
-    _clone_once("https://github.com/IDEA-Research/GroundingDINO.git", models_dir / "GroundingDINO")
-    _clone_once("https://github.com/jaychempan/LAE-DINO.git", models_dir / "LAE-DINO")
+    """Extract versioned worker/config sources without any runtime Git access."""
+    archive = models_dir / "offline" / "rsmem-perception-sources-v1.tar.gz"
+    marker = workspace / ".rsmem-source-bundle.json"
+    checksum = _sha256(archive)
+    required = (
+        workspace / "RSMeM-public" / "tools" / "deploy_tools" / "sam2_api.py",
+        workspace / "OpenEarthAgent" / "tool_server" / "tool_workers" / "online_workers" / "controller.py",
+        workspace / "OpenEarthAgent" / "tool_server" / "utils" / "server_utils.py",
+        models_dir / "GroundingDINO" / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py",
+        models_dir / "LAE-DINO" / "mmdetection_lae",
+        workspace / "easyocr" / "model" / "craft_mlt_25k.pth",
+    )
+    try:
+        current = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        current = {}
+    if current.get("sha256") != checksum or not all(path.exists() for path in required):
+        for target in (
+            workspace / "RSMeM-public",
+            workspace / "OpenEarthAgent",
+            models_dir / "GroundingDINO",
+            models_dir / "LAE-DINO",
+            workspace / "easyocr",
+        ):
+            if target.exists():
+                shutil.rmtree(target)
+        _safe_extract(archive, workspace)
+        marker.write_text(json.dumps({"sha256": checksum}, indent=2) + "\n", encoding="utf-8")
 
     # Keep the deployed workers byte-for-byte aligned with the versions tested
     # on QY_11.  The public repositories remain the source trees; these three

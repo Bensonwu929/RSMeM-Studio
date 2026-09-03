@@ -14,13 +14,32 @@ does not load every historical EarthBench/OEA model at once. Large files stay in
 | open-vocabulary detection / `ObjectDetection` | LAE-DINO Swin-T | `QY_11:/slow_share2/ultrafast_share/gzh_data/baijin/OpenEarthAgent/models/lae_dino_swint_lae1m-28ca3a15.pth` | `/mnt/workspace/models/lae_dino_swint_lae1m-28ca3a15.pth` | [LAE-DINO source](https://github.com/jaychempan/LAE-DINO), [official OEA checkpoint link](https://drive.google.com/uc?id=1EiR8KtNRYIeOfvtIe9C82cQk_uOMIQ8U) |
 | LAE-DINO language encoder (auxiliary) | BERT base uncased, safetensors-only bundle | `QY_11:/slow_share2/ultrafast_share/gzh_data/baijin/OpenEarthAgent/models/bert-base-uncased/` | `/mnt/workspace/models/bert-base-uncased/` | [Google BERT](https://huggingface.co/google-bert/bert-base-uncased) |
 | description, region attributes, counting / three OEA tools | Qwen3-VL-8B-Instruct | `QY_11:/slow_share2/ultrafast_share/gzh_data/baijin/OpenEarthAgent/models/Qwen3-VL-8B-Instruct/` | `/mnt/workspace/models/Qwen3-VL-8B-Instruct/` | [ModelScope model](https://modelscope.cn/models/Qwen/Qwen3-VL-8B-Instruct) |
-| OCR / `OCR` | EasyOCR detector + Chinese/English recognizers | `QY_11:/root/.EasyOCR/model/{craft_mlt_25k.pth,zh_sim_g2.pth}` | `/mnt/workspace/easyocr/model/` (set `EASYOCR_MODULE_PATH=/mnt/workspace/easyocr`) | [EasyOCR](https://github.com/JaidedAI/EasyOCR) |
+| OCR / `OCR` | EasyOCR detector + Chinese/English recognizers | `QY_11:/slow_share2/ultrafast_share/gzh_data/baijin/easyocr/model/` | `/mnt/workspace/easyocr/model/` (set `EASYOCR_MODULE_PATH=/mnt/workspace/easyocr`) | [EasyOCR](https://github.com/JaidedAI/EasyOCR) |
 
 Verified sizes on QY_11 (2026-09-03): SAM2 184,416,285 bytes;
 RemoteCLIP 1,710,613,765; ChangeOS 233,553,904; BRIGHT 132,432,363;
 Grounding DINO 693,997,677; LAE-DINO 724,694,893; the minimal BERT inference
-bundle 441,147,956; Qwen3-VL directory 17,545,917,594 bytes. EasyOCR downloads
-its own weights on first start.
+bundle 441,147,956; Qwen3-VL directory 17,545,917,594 bytes. EasyOCR weights are
+included in the offline source bundle; workers do not download them at startup.
+
+## Offline deployment archives
+
+The private ModelScope model repository also stores the following build outputs
+under `offline/`:
+
+- `rsmem-perception-sources-v1.tar.gz`: minimal EarthBench/OEA worker sources,
+  GroundingDINO, LAE-DINO, and EasyOCR weights;
+- `sam2-py310-cu121-v1.tar.gz`, `remoteclip-py310-cu121-v1.tar.gz`,
+  `changeos-py310-cu121-v1.tar.gz`, and `bright-py310-cu121-v1.tar.gz`: the
+  four independently validated EarthBench runtimes, kept separate exactly as
+  on QY_11;
+- `oea-e1-py310-cu124-v1.tar.gz`: controller, OCR, GroundingDINO, and Qwen3-VL;
+- `oea-e3-py310-cu124-v1.tar.gz`: repaired and validated LAE-DINO runtime;
+- `SHA256SUMS`: mandatory integrity manifest.
+
+Studio startup downloads only from ModelScope, verifies every archive, extracts
+it into `/mnt/workspace`, runs `conda-unpack`, and then starts HTTP workers. No
+runtime Git clone or dependency installation is permitted.
 
 ## Source trees and configs
 
