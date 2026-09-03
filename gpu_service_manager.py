@@ -89,7 +89,9 @@ class GPUServiceManager:
     def start(self) -> "GPUServiceManager":
         if not _truthy("RSMEM_GPU_AUTOSTART"):
             self.skipped["all"] = "RSMEM_GPU_AUTOSTART is disabled"
+            print("[xgpu] autostart disabled", flush=True)
             return self
+        print("[xgpu] starting background asset/runtime bootstrap", flush=True)
         self._startup_thread = threading.Thread(
             target=self._start_selected_services,
             name="rsmem-gpu-startup",
@@ -102,12 +104,17 @@ class GPUServiceManager:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         os.environ["RSMEM_ENABLE_GPU_PERCEPTION"] = "1"
         try:
+            print(f"[xgpu] validating model assets in {MODELS}", flush=True)
             prepare_xgpu_assets(MODELS, WORKSPACE)
+            print("[xgpu] model assets and source trees are ready", flush=True)
             if _truthy("RSMEM_GPU_BOOTSTRAP_ENVS", "1"):
+                print("[xgpu] validating persistent Python 3.10 worker environments", flush=True)
                 interpreters = ensure_xgpu_runtime_envs(WORKSPACE, MODELS)
                 configure_runtime_environment(interpreters)
+                print("[xgpu] persistent worker environments are ready", flush=True)
         except Exception as exc:
             self.skipped["asset-bootstrap"] = f"{type(exc).__name__}: {exc}"
+            print(f"[xgpu] bootstrap failed: {type(exc).__name__}: {exc}", flush=True)
             return
         selected = {
             item.strip() for item in os.getenv("RSMEM_GPU_SERVICES", "").split(",") if item.strip()
@@ -126,8 +133,10 @@ class GPUServiceManager:
                 continue
             if _reachable(spec):
                 self.skipped[spec.name] = "already running"
+                print(f"[xgpu] {spec.name}: already healthy", flush=True)
                 continue
             log_path = LOG_DIR / f"{spec.name}.log"
+            print(f"[xgpu] {spec.name}: starting; log={log_path}", flush=True)
             handle = log_path.open("ab", buffering=0)
             environment = os.environ.copy()
             environment.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -156,13 +165,16 @@ class GPUServiceManager:
             wait_seconds = int(os.getenv("RSMEM_GPU_STARTUP_TIMEOUT_SEC", "300"))
             for _ in range(wait_seconds):
                 if _reachable(spec):
+                    print(f"[xgpu] {spec.name}: healthy", flush=True)
                     break
                 if process.poll() is not None:
                     self.skipped[spec.name] = f"exited during startup; see {log_path}"
+                    print(f"[xgpu] {spec.name}: exited during startup; see {log_path}", flush=True)
                     break
                 time.sleep(1)
             else:
                 self.skipped[spec.name] = f"startup timed out; see {log_path}"
+                print(f"[xgpu] {spec.name}: startup timed out; see {log_path}", flush=True)
 
     def status(self) -> dict:
         return {
