@@ -245,11 +245,87 @@ def test_runtime_downloads_only_missing_archive_and_deletes_it(tmp_path, monkeyp
     monkeypatch.setattr(xgpu_runtime, "_download_archive", fake_download)
     monkeypatch.setattr(xgpu_runtime.subprocess, "run", lambda *args, **kwargs: None)
     interpreters = xgpu_runtime.ensure_xgpu_runtime_envs(workspace, models)
-    assert downloaded == [Path(item).name for item in xgpu_runtime.OFFLINE_ENV_ARCHIVES.values()]
+    # Runtimes are prepared concurrently, so completion order is not fixed.
+    assert sorted(downloaded) == sorted(
+        Path(item).name for item in xgpu_runtime.OFFLINE_ENV_ARCHIVES.values()
+    )
     assert all(path.is_file() for path in interpreters.values())
     assert not (workspace / ".rsmem-runtime-downloads" / "offline").exists() or not any(
         (workspace / ".rsmem-runtime-downloads" / "offline").iterdir()
     )
+
+
+def test_runtimes_are_prepared_concurrently(tmp_path, monkeypatch):
+    import threading
+
+    workspace = tmp_path / "workspace"
+    models = workspace / "models"
+    (models / "offline").mkdir(parents=True)
+    checksums = []
+    for relative in xgpu_runtime.OFFLINE_ENV_ARCHIVES.values():
+        archive = models / relative
+        with tarfile.open(archive, "w:gz") as bundle:
+            payload = b"#!/bin/sh\n"
+            info = tarfile.TarInfo("bin/python")
+            info.mode = 0o755
+            info.size = len(payload)
+            bundle.addfile(info, io.BytesIO(payload))
+        checksums.append(f"{xgpu_runtime._sha256(archive)}  {archive.name}")
+    (models / "offline" / "SHA256SUMS").write_text(
+        "\n".join(checksums) + "\n", encoding="utf-8"
+    )
+
+    barrier = threading.Barrier(len(xgpu_runtime.OFFLINE_ENV_ARCHIVES), timeout=10)
+    real_install = xgpu_runtime._install_archive
+
+    def blocking_install(prefix, archive, expected_sha256, label=""):
+        # Deadlocks unless every runtime is installed at the same time.
+        barrier.wait()
+        return real_install(prefix, archive, expected_sha256, label)
+
+    monkeypatch.setattr(xgpu_runtime, "_install_archive", blocking_install)
+    monkeypatch.setattr(xgpu_runtime.subprocess, "run", lambda *args, **kwargs: None)
+    interpreters = xgpu_runtime.ensure_xgpu_runtime_envs(workspace, models)
+    assert set(interpreters) == set(xgpu_runtime.OFFLINE_ENV_ARCHIVES)
+    assert all(path.is_file() for path in interpreters.values())
+
+
+def test_runtime_failure_names_the_offending_runtime(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    models = workspace / "models"
+    (models / "offline").mkdir(parents=True)
+    checksums = []
+    for relative in xgpu_runtime.OFFLINE_ENV_ARCHIVES.values():
+        archive = models / relative
+        archive.write_bytes(b"payload")
+        checksums.append(f"{xgpu_runtime._sha256(archive)}  {archive.name}")
+    (models / "offline" / "SHA256SUMS").write_text(
+        "\n".join(checksums) + "\n", encoding="utf-8"
+    )
+
+    def failing_install(prefix, archive, expected_sha256, label=""):
+        if label == "changeos":
+            raise RuntimeError("conda-unpack exploded")
+        (prefix / "bin").mkdir(parents=True, exist_ok=True)
+        (prefix / "bin" / "python").write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(xgpu_runtime, "_install_archive", failing_install)
+    with pytest.raises(RuntimeError) as failure:
+        xgpu_runtime.ensure_xgpu_runtime_envs(workspace, models)
+    assert "changeos" in str(failure.value)
+    assert "conda-unpack exploded" in str(failure.value)
+
+
+def test_extraction_rejects_paths_outside_the_prefix(tmp_path):
+    archive = tmp_path / "hostile.tar.gz"
+    with tarfile.open(archive, "w:gz") as bundle:
+        payload = b"x"
+        info = tarfile.TarInfo("../escaped")
+        info.size = len(payload)
+        bundle.addfile(info, io.BytesIO(payload))
+    with pytest.raises(RuntimeError, match="Unsafe path"):
+        xgpu_runtime._safe_extract(archive, tmp_path / "prefix")
+    assert not (tmp_path / "escaped").exists()
 
 
 def test_archive_download_retries_after_a_stalled_connection(tmp_path, monkeypatch):

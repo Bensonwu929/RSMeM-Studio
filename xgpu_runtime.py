@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
@@ -33,26 +34,58 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _safe_extract(archive: Path, destination: Path) -> None:
+def _safe_extract(archive: Path, destination: Path, label: str = "") -> int:
+    """Stream one pass over the archive, validating each member before writing.
+
+    A gzip stream cannot be rewound, so collecting the member list first and
+    extracting afterwards decompresses the whole archive twice.
+    """
     destination.mkdir(parents=True, exist_ok=True)
     root = destination.resolve()
-    with tarfile.open(archive, "r:gz") as bundle:
-        for member in bundle.getmembers():
+    started = time.time()
+    extracted = 0
+    with tarfile.open(archive, "r|gz") as bundle:
+        for member in bundle:
             target = (destination / member.name).resolve()
             if target != root and root not in target.parents:
                 raise RuntimeError(f"Unsafe path in offline archive: {member.name}")
-        bundle.extractall(destination, filter="fully_trusted")
+            bundle.extract(member, destination, filter="fully_trusted")
+            extracted += 1
+            if label and extracted % 5000 == 0:
+                print(
+                    f"[xgpu] {label}: extracted {extracted} files "
+                    f"in {time.time() - started:.0f}s",
+                    flush=True,
+                )
+    return extracted
 
 
-def _install_archive(prefix: Path, archive: Path, expected_sha256: str) -> None:
+def _install_archive(
+    prefix: Path, archive: Path, expected_sha256: str, label: str = ""
+) -> None:
     if not archive.is_file():
         raise RuntimeError(f"Offline runtime archive is missing: {archive}")
     if prefix.exists():
         shutil.rmtree(prefix)
-    _safe_extract(archive, prefix)
+    started = time.time()
+    extracted = _safe_extract(archive, prefix, label)
+    print(
+        f"[xgpu] {label or prefix.name}: extracted {extracted} files "
+        f"in {time.time() - started:.0f}s",
+        flush=True,
+    )
     unpack = prefix / "bin" / "conda-unpack"
     if unpack.is_file():
-        subprocess.run([str(unpack)], check=True, cwd=str(prefix))
+        started = time.time()
+        subprocess.run(
+            [str(unpack)], check=True, cwd=str(prefix),
+            timeout=CONDA_UNPACK_TIMEOUT_SECONDS,
+        )
+        print(
+            f"[xgpu] {label or prefix.name}: conda-unpack finished "
+            f"in {time.time() - started:.0f}s",
+            flush=True,
+        )
     python = prefix / "bin" / "python"
     if not python.is_file():
         raise RuntimeError(f"Offline runtime has no Python interpreter: {prefix}")
@@ -84,6 +117,7 @@ def _checksums(models: Path) -> dict[str, str]:
 
 DOWNLOAD_ATTEMPTS = int(os.getenv("RSMEM_DOWNLOAD_ATTEMPTS", "4"))
 DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("RSMEM_DOWNLOAD_TIMEOUT", "2700"))
+CONDA_UNPACK_TIMEOUT_SECONDS = int(os.getenv("RSMEM_CONDA_UNPACK_TIMEOUT", "3600"))
 
 # Run the download in a child process so a stalled connection can be killed.
 # A stalled in-process download once held the bootstrap for four hours before
@@ -151,44 +185,91 @@ def _download_archive(models: Path, relative: str, workspace: Path) -> Path:
     )
 
 
+def _runtime_is_ready(prefix: Path, filename: str, expected_sha256: str) -> bool:
+    try:
+        current = json.loads((prefix / ".rsmem-runtime.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (prefix / "bin" / "python").is_file() and current == {
+        "schema": ENV_SCHEMA,
+        "archive": filename,
+        "sha256": expected_sha256,
+    }
+
+
+def _prepare_runtime(
+    name: str, relative: str, expected_sha256: str, workspace: Path, models: Path
+) -> None:
+    """Download, verify and install one runtime, then drop its archive."""
+    filename = Path(relative).name
+    prefix = workspace / "envs" / name
+    started = time.time()
+    print(f"[xgpu] preparing offline runtime {name}", flush=True)
+    archive = models / relative
+    if not archive.is_file():
+        archive = _download_archive(models, relative, workspace)
+    if _sha256(archive) != expected_sha256:
+        archive.unlink(missing_ok=True)
+        raise RuntimeError(f"Offline runtime checksum mismatch: {filename}")
+    _install_archive(prefix, archive, expected_sha256, label=name)
+    archive.unlink(missing_ok=True)
+    free_gb = shutil.disk_usage(workspace).free / 1024 ** 3
+    print(
+        f"[xgpu] runtime {name} ready in {time.time() - started:.0f}s "
+        f"· {free_gb:.1f} GiB free",
+        flush=True,
+    )
+
+
 def ensure_xgpu_runtime_envs(workspace: Path, models: Path) -> dict[str, Path]:
-    """Extract versioned offline runtimes once; never invoke conda or pip."""
+    """Extract versioned offline runtimes once; never invoke conda or pip.
+
+    Each archive expands into tens of thousands of small files, and on the
+    persistent volume the per-file write latency dominates. The runtimes are
+    independent, so they are prepared concurrently.
+    """
     env_root = workspace / "envs"
     lock_path = workspace / ".rsmem-env-bootstrap.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         checksums = _checksums(models)
-        interpreters: dict[str, Path] = {}
+        pending = []
         for name, relative in OFFLINE_ENV_ARCHIVES.items():
             filename = Path(relative).name
             expected_sha256 = checksums.get(filename)
             if not expected_sha256:
                 raise RuntimeError(f"Missing checksum for offline runtime: {filename}")
-            archive = models / relative
-            prefix = env_root / name
-            marker = prefix / ".rsmem-runtime.json"
-            current = {}
-            try:
-                current = json.loads(marker.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                pass
-            ready = (prefix / "bin" / "python").is_file() and current == {
-                "schema": ENV_SCHEMA,
-                "archive": filename,
-                "sha256": expected_sha256,
-            }
-            if not ready:
-                print(f"[xgpu] extracting offline runtime {name}", flush=True)
-                if not archive.is_file():
-                    archive = _download_archive(models, relative, workspace)
-                if _sha256(archive) != expected_sha256:
-                    archive.unlink(missing_ok=True)
-                    raise RuntimeError(f"Offline runtime checksum mismatch: {filename}")
-                _install_archive(prefix, archive, expected_sha256)
-                archive.unlink(missing_ok=True)
-            interpreters[name] = prefix / "bin" / "python"
-    return interpreters
+            if not _runtime_is_ready(env_root / name, filename, expected_sha256):
+                pending.append((name, relative, expected_sha256))
+
+        if pending:
+            workers = max(1, min(int(os.getenv("RSMEM_ENV_EXTRACT_WORKERS", "6")), len(pending)))
+            free_gb = shutil.disk_usage(workspace).free / 1024 ** 3
+            print(
+                f"[xgpu] preparing {len(pending)} runtime(s) with {workers} worker(s) "
+                f"· {free_gb:.1f} GiB free",
+                flush=True,
+            )
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_prepare_runtime, name, relative, sha, workspace, models): name
+                    for name, relative, sha in pending
+                }
+                failures = []
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:  # noqa: BLE001 - report every failure
+                        failures.append(f"{name}: {type(exc).__name__}: {exc}")
+                        print(f"[xgpu] runtime {name} failed: {exc}", flush=True)
+            if failures:
+                raise RuntimeError(
+                    "Offline runtime preparation failed for " + "; ".join(failures)
+                )
+
+    return {name: env_root / name / "bin" / "python" for name in OFFLINE_ENV_ARCHIVES}
 
 
 def configure_runtime_environment(interpreters: dict[str, Path]) -> None:
