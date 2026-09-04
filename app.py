@@ -2119,7 +2119,8 @@ def _resolve_connection(
             raise gr.Error(
                 "ModelScope quota mode is not configured on this deployment yet. "
                 "Switch to the OpenAI-compatible API mode, or ask the Studio owner "
-                "to set OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET."
+                "to enable OAuth under Settings -> adjust deployment settings -> "
+                "OAuth settings and redeploy."
             )
         token = msoauth.SESSION_STORE.get_token(session_id)
         if not token:
@@ -2144,8 +2145,19 @@ def _ms_status_html(session_id: str | None) -> tuple[str, bool]:
         return (
             '<div class="auth-box"><div class="st"><span class="dot">●</span> '
             "ModelScope quota mode · not configured on this deployment</div>"
-            "<p>The Studio owner has not set the OAuth client yet. Use the "
+            "<p>The Studio owner has not enabled OAuth under <b>Settings → "
+            "adjust deployment settings → OAuth settings</b> yet. Use the "
             "OpenAI-compatible API mode instead.</p></div>",
+            False,
+        )
+    if not msoauth.studio_host() and not os.getenv("OAUTH_REDIRECT_URI", "").strip():
+        return (
+            '<div class="auth-box"><div class="st"><span class="dot">●</span> '
+            "ModelScope quota mode · callback domain unknown</div>"
+            "<p>This deployment did not receive the Studio access domain, so "
+            "ModelScope would reject the sign-in redirect. The owner needs to "
+            "enable OAuth in the Studio settings and redeploy. Use the "
+            "OpenAI-compatible API mode meanwhile.</p></div>",
             False,
         )
     if not session_id:
@@ -2168,6 +2180,7 @@ def _ms_status_html(session_id: str | None) -> tuple[str, bool]:
             True,
         )
     nonce = msoauth.SESSION_STORE.mint_login_nonce(session_id)
+    callback = _esc(msoauth.resolve_redirect_uri(None, None))
     return (
         '<div class="auth-box"><div class="st"><span class="dot">●</span> '
         "ModelScope session · not connected</div>"
@@ -2175,7 +2188,8 @@ def _ms_status_html(session_id: str | None) -> tuple[str, bool]:
         "needed. The sign-in page opens in a new tab; afterwards return here "
         "and press <b>Refresh sign-in status</b>.</p>"
         f'<a class="ms-signin" href="oauth/login?nonce={nonce}" target="_blank" '
-        'rel="noopener">Sign in with ModelScope</a></div>',
+        'rel="noopener">Sign in with ModelScope</a>'
+        f'<p class="auth-hint">Authorization returns to {callback}</p></div>',
         False,
     )
 
@@ -2331,6 +2345,7 @@ CSS = """
 .auth-box p {font-size:12.5px; color:#737373; margin:4px 0 0;}
 .auth-box .ms-signin {display:block; margin-top:12px; background:#202020; color:#ffffff !important; text-align:center; font-weight:650; border-radius:9px; padding:11px 18px; text-decoration:none;}
 .auth-box .ms-signin:hover {background:#333333;}
+.auth-box p.auth-hint {font-size:11.5px; color:#8f8f8f; margin-top:8px; word-break:break-all;}
 #ms-refresh, #ms-signout {max-width:220px;}
 
 /* Run button: strong but not full-bleed */
@@ -2918,7 +2933,16 @@ def create_app():
         try:
             redirect_uri = _request_redirect_uri(request.headers)
         except ValueError:
-            return PlainTextResponse("Cannot determine the callback host.", status_code=500)
+            return HTMLResponse(
+                _oauth_page(
+                    "Callback domain is not configured",
+                    "<p>This deployment could not determine the Studio's own "
+                    "access domain, and ModelScope refuses a redirect to any "
+                    "other host. The Studio owner needs to enable OAuth in the "
+                    "Studio settings and redeploy.</p>",
+                ),
+                status_code=500,
+            )
         return RedirectResponse(
             msoauth.build_authorize_url(msoauth.oauth_client_id(), redirect_uri, nonce)
         )
@@ -2927,11 +2951,15 @@ def create_app():
     async def oauth_callback(request: Request):
         params = request.query_params
         if params.get("error"):
+            detail = html_lib.escape(
+                (params.get("error_description") or params.get("error") or "").strip()
+            )
             return HTMLResponse(
                 _oauth_page(
                     "Sign-in was not completed",
                     "<p>The authorization was cancelled or rejected. You can close "
-                    "this tab and try again from the RSMeM page.</p>",
+                    "this tab and try again from the RSMeM page.</p>"
+                    + (f"<p>ModelScope reported: {detail}</p>" if detail else ""),
                 ),
                 status_code=400,
             )

@@ -132,6 +132,37 @@ For a team-managed deployment, environment variables remain supported:
 If no key is supplied or the provider is unavailable, execution stops with an
 explicit error; the Studio never replaces model planning with a preset fallback.
 
+## ModelScope quota mode (OAuth)
+
+The second connection mode lets a visitor sign in with their own ModelScope
+account so that runs consume their own API-Inference quota. It relies on the
+Studio's built-in OAuth support rather than a hand-registered application.
+
+To enable it on a deployment:
+
+1. Open the Studio's **Settings**, then **adjust deployment settings**.
+2. Under **OAuth settings**, choose **enable**.
+3. Set the token lifetime and tick the `openid`, `profile`, and `api-inference`
+   scopes. `api-inference` is what authorizes inference calls on the visitor's
+   behalf; do not tick repository or MCP scopes, which this Studio never uses.
+4. Save, then **redeploy**. The runtime only receives the injected
+   configuration on a fresh container start.
+
+ModelScope then injects `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`,
+`OAUTH_SCOPES`, `OPENID_PROVIDER_URL`, and `STUDIO_HOST`. None of these belong
+in the repository.
+
+The callback must target the Studio's own access domain
+(`https://<owner>-<name>.ms.show/oauth/callback`). The Studio page is served
+inside an iframe on `modelscope.cn`, so the proxy headers report the platform
+shell instead; authorizing against that host makes ModelScope reject the
+request with `ExternalRedirectForbidden`. `STUDIO_HOST` is therefore preferred
+over `x-forwarded-host`, and a host under `modelscope.cn` is never used as the
+callback. Set `OAUTH_REDIRECT_URI` only to override this deliberately.
+
+Visitor tokens stay in process memory, keyed by a random browser session id.
+They are never written to disk, logs, state dictionaries, or the client page.
+
 ## Resources
 
 - Source: https://github.com/AI9Stars/RSMeM

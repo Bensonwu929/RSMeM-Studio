@@ -18,7 +18,11 @@ class FakeRequest:
         self.cookies = dict(cookies or {})
 
 
-OAUTH_ENV = {"OAUTH_CLIENT_ID": "test-client-id", "OAUTH_CLIENT_SECRET": "test-client-secret"}
+OAUTH_ENV = {
+    "OAUTH_CLIENT_ID": "test-client-id",
+    "OAUTH_CLIENT_SECRET": "test-client-secret",
+    "STUDIO_HOST": "wbx929-rsmem.ms.show",
+}
 
 
 class OAuthSessionStoreTests(unittest.TestCase):
@@ -54,7 +58,18 @@ class OAuthSessionStoreTests(unittest.TestCase):
             self.assertIsNone(self.store.get_token("sid-1"))
 
 
+NO_HOST_ENV = {
+    "OAUTH_REDIRECT_URI": "",
+    "STUDIO_HOST": "",
+    "SPACE_HOST": "",
+}
+
+
 class OAuthUrlTests(unittest.TestCase):
+    def setUp(self):
+        msoauth.reset_endpoint_cache()
+        self.addCleanup(msoauth.reset_endpoint_cache)
+
     def test_authorize_url_carries_required_oauth_params(self):
         url = msoauth.build_authorize_url(
             "cid", "https://wbx929-rsmem.ms.show/oauth/callback", "state-1"
@@ -70,9 +85,101 @@ class OAuthUrlTests(unittest.TestCase):
         )
 
     def test_redirect_uri_prefers_forwarded_host_over_proxy_host(self):
-        with patch.dict(os.environ, {"OAUTH_REDIRECT_URI": ""}):
+        with patch.dict(os.environ, NO_HOST_ENV):
             uri = msoauth.resolve_redirect_uri("wbx929-rsmem.ms.show", "internal:7860")
         self.assertEqual(uri, "https://wbx929-rsmem.ms.show/oauth/callback")
+
+    def test_injected_studio_host_wins_over_the_platform_shell_header(self):
+        """The iframe shell forwards modelscope.cn, which ModelScope rejects."""
+        with patch.dict(os.environ, {**NO_HOST_ENV, "STUDIO_HOST": "wbx929-rsmem.ms.show"}):
+            uri = msoauth.resolve_redirect_uri("modelscope.cn", "internal:7860")
+        self.assertEqual(uri, "https://wbx929-rsmem.ms.show/oauth/callback")
+
+    def test_studio_host_carrying_a_scheme_is_normalized(self):
+        with patch.dict(
+            os.environ, {**NO_HOST_ENV, "STUDIO_HOST": "https://wbx929-rsmem.ms.show/"}
+        ):
+            self.assertEqual(
+                msoauth.resolve_redirect_uri(None, None),
+                "https://wbx929-rsmem.ms.show/oauth/callback",
+            )
+
+    def test_space_host_is_used_when_studio_host_is_absent(self):
+        with patch.dict(os.environ, {**NO_HOST_ENV, "SPACE_HOST": "wbx929-rsmem.ms.show"}):
+            self.assertEqual(
+                msoauth.resolve_redirect_uri(None, None),
+                "https://wbx929-rsmem.ms.show/oauth/callback",
+            )
+
+    def test_platform_shell_host_alone_is_refused_instead_of_being_authorized(self):
+        with patch.dict(os.environ, NO_HOST_ENV):
+            with self.assertRaises(ValueError):
+                msoauth.resolve_redirect_uri("www.modelscope.cn", None)
+
+    def test_explicit_redirect_uri_overrides_every_other_source(self):
+        with patch.dict(
+            os.environ,
+            {
+                "OAUTH_REDIRECT_URI": "https://example.ms.show/oauth/callback",
+                "STUDIO_HOST": "wbx929-rsmem.ms.show",
+            },
+        ):
+            self.assertEqual(
+                msoauth.resolve_redirect_uri(None, None),
+                "https://example.ms.show/oauth/callback",
+            )
+
+    def test_scopes_follow_the_studio_settings_but_always_keep_openid(self):
+        with patch.dict(os.environ, {"OAUTH_SCOPES": "profile api-inference"}):
+            self.assertEqual(msoauth.oauth_scopes(), "openid profile api-inference")
+        with patch.dict(os.environ, {"OAUTH_SCOPES": "openid api-inference"}):
+            self.assertEqual(msoauth.oauth_scopes(), "openid api-inference")
+        with patch.dict(os.environ, {"OAUTH_SCOPES": ""}):
+            self.assertEqual(msoauth.oauth_scopes(), msoauth.OAUTH_SCOPES)
+
+    def test_endpoints_come_from_oidc_discovery_when_the_provider_is_injected(self):
+        metadata = {
+            "authorization_endpoint": "https://www.modelscope.cn/oauth/authorize",
+            "token_endpoint": "https://www.modelscope.cn/oauth/token",
+            "userinfo_endpoint": "https://www.modelscope.cn/oauth/userinfo",
+        }
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return metadata
+
+        calls = []
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            return FakeResponse()
+
+        with patch.dict(os.environ, {"OPENID_PROVIDER_URL": "https://www.modelscope.cn/"}), \
+             patch.object(msoauth.httpx, "get", fake_get):
+            self.assertEqual(msoauth.discover_endpoints(), metadata)
+            msoauth.discover_endpoints()
+        self.assertEqual(
+            calls, ["https://www.modelscope.cn/.well-known/openid-configuration"]
+        )
+
+    def test_unreachable_discovery_falls_back_to_the_published_endpoints(self):
+        def exploding_get(url, **kwargs):
+            raise msoauth.httpx.ConnectError("no route")
+
+        with patch.dict(os.environ, {"OPENID_PROVIDER_URL": "https://www.modelscope.cn"}), \
+             patch.object(msoauth.httpx, "get", exploding_get):
+            endpoints = msoauth.discover_endpoints()
+        self.assertEqual(
+            endpoints,
+            {
+                "authorization_endpoint": msoauth.AUTHORIZE_URL,
+                "token_endpoint": msoauth.TOKEN_URL,
+                "userinfo_endpoint": msoauth.USERINFO_URL,
+            },
+        )
 
 
 class ConnectionResolutionTests(unittest.TestCase):
@@ -146,6 +253,18 @@ class SessionStatusTests(unittest.TestCase):
         self.assertTrue(signed_in)
         self.assertIn("alice", html)
         self.assertNotIn("secret-token", html)
+
+    def test_disconnected_status_names_the_callback_domain(self):
+        with patch.dict(os.environ, OAUTH_ENV):
+            html, _ = app._ms_status_html("sid-status")
+        self.assertIn("https://wbx929-rsmem.ms.show/oauth/callback", html)
+
+    def test_missing_studio_domain_blocks_sign_in_instead_of_failing_at_modelscope(self):
+        with patch.dict(os.environ, {**OAUTH_ENV, **NO_HOST_ENV}):
+            html, signed_in = app._ms_status_html("sid-status")
+        self.assertFalse(signed_in)
+        self.assertIn("callback domain unknown", html)
+        self.assertNotIn("oauth/login?nonce=", html)
 
     def test_refresh_mints_a_browser_session_id_without_cookies(self):
         with patch.dict(os.environ, OAUTH_ENV):

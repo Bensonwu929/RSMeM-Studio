@@ -6,10 +6,11 @@ quota. Tokens live only in this process's memory, keyed by a random browser
 session id stored in a cookie; they are never written to disk, logs, state
 dicts, or the client page.
 
-Endpoints and the `api-inference` scope follow the official ModelScope OAuth
-guide (modelscope.cn/learn/6670) and the PaperSeek Studio reference
-implementation. The OAuth client id/secret must be provided by the Studio
-owner through environment variables — never committed to the repository.
+Configuration comes from the Studio's built-in OAuth support: once the owner
+enables it, ModelScope creates the OAuth application and injects
+``OAUTH_CLIENT_ID``, ``OAUTH_CLIENT_SECRET``, ``OAUTH_SCOPES``,
+``OPENID_PROVIDER_URL`` and ``STUDIO_HOST`` into the runtime. Nothing here may
+be committed to the repository.
 """
 
 from __future__ import annotations
@@ -28,6 +29,11 @@ USERINFO_URL = "https://www.modelscope.cn/oauth/userinfo"
 INFERENCE_BASE_URL = "https://api-inference.modelscope.cn/v1"
 OAUTH_SCOPES = "openid profile api-inference"
 
+# The Studio page is embedded in an iframe on modelscope.cn, so a forwarded
+# host under this domain is the platform shell rather than the Studio's own
+# origin. Authorizing against it is what triggers ExternalRedirectForbidden.
+PLATFORM_HOST_SUFFIXES = ("modelscope.cn", "modelscope.ai")
+
 SESSION_COOKIE = "rsmem_sid"
 NONCE_TTL_SECONDS = 15 * 60
 SESSION_TTL_SECONDS = 12 * 60 * 60
@@ -45,20 +51,123 @@ def oauth_configured() -> bool:
     return bool(oauth_client_id() and oauth_client_secret())
 
 
-def resolve_redirect_uri(forwarded_host: str | None, host: str | None) -> str:
-    """Redirect URI must use the Studio's ms.show host, not modelscope.cn.
+def _normalize_host(value: str | None) -> str:
+    """Reduce a configured or forwarded host value to a bare ``host[:port]``."""
+    chosen = (value or "").split(",")[0].strip()
+    if not chosen:
+        return ""
+    for scheme in ("https://", "http://"):
+        if chosen.lower().startswith(scheme):
+            chosen = chosen[len(scheme) :]
+            break
+    return chosen.strip("/").strip()
 
-    The Studio page on modelscope.cn embeds the app in an iframe, so the
-    registered callback has to target the real app host. Behind the platform
-    reverse proxy the original host arrives in ``x-forwarded-host``.
+
+def _is_platform_host(host: str) -> bool:
+    bare = host.split(":")[0].lower().rstrip(".")
+    return any(
+        bare == suffix or bare.endswith(f".{suffix}")
+        for suffix in PLATFORM_HOST_SUFFIXES
+    )
+
+
+def studio_host() -> str:
+    """The Studio's own access domain, as injected by ModelScope.
+
+    ``STUDIO_HOST`` is the documented general variable; ``SPACE_HOST`` is the
+    Gradio-compatibility alias the platform injects alongside it. Both are
+    documented as carrying no scheme, but tolerate one anyway.
+    """
+    for name in ("STUDIO_HOST", "SPACE_HOST"):
+        host = _normalize_host(os.getenv(name))
+        if host:
+            return host
+    return ""
+
+
+def resolve_redirect_uri(forwarded_host: str | None, host: str | None) -> str:
+    """Redirect URI must target the Studio's own domain.
+
+    ModelScope rejects an authorization request whose ``redirect_uri`` points
+    anywhere other than the Studio's access domain with
+    ``ExternalRedirectForbidden``. Prefer the platform-injected host over the
+    proxy headers, which report the modelscope.cn shell instead.
     """
     explicit = os.getenv("OAUTH_REDIRECT_URI", "").strip()
     if explicit:
         return explicit
-    chosen = (forwarded_host or host or "").split(",")[0].strip()
+    chosen = studio_host()
+    if not chosen:
+        for candidate in (forwarded_host, host):
+            normalized = _normalize_host(candidate)
+            if normalized and not _is_platform_host(normalized):
+                chosen = normalized
+                break
     if not chosen:
         raise ValueError("Cannot determine the OAuth redirect host.")
     return f"https://{chosen}/oauth/callback"
+
+
+def oauth_scopes() -> str:
+    """Requested scopes, honouring what the owner ticked in Studio settings.
+
+    ``openid`` is mandatory for the authorization code flow, so it is added
+    back even if the injected value omits it.
+    """
+    configured = (os.getenv("OAUTH_SCOPES", "") or "").split()
+    scopes = configured or OAUTH_SCOPES.split()
+    if "openid" not in scopes:
+        scopes = ["openid", *scopes]
+    return " ".join(scopes)
+
+
+_ENDPOINT_DEFAULTS = {
+    "authorization_endpoint": AUTHORIZE_URL,
+    "token_endpoint": TOKEN_URL,
+    "userinfo_endpoint": USERINFO_URL,
+}
+_endpoint_lock = threading.Lock()
+_endpoint_cache: dict[str, str] | None = None
+
+
+def discover_endpoints() -> dict[str, str]:
+    """Resolve the OIDC endpoints, falling back to the published constants.
+
+    ``OPENID_PROVIDER_URL`` is injected by the Studio runtime. Discovery is
+    attempted once per process; any failure keeps the hard-coded endpoints so
+    that sign-in never breaks because metadata was briefly unreachable.
+    """
+    global _endpoint_cache
+    with _endpoint_lock:
+        if _endpoint_cache is not None:
+            return dict(_endpoint_cache)
+        provider = (os.getenv("OPENID_PROVIDER_URL", "") or "").strip().rstrip("/")
+        endpoints = dict(_ENDPOINT_DEFAULTS)
+        if provider:
+            try:
+                response = httpx.get(
+                    f"{provider}/.well-known/openid-configuration",
+                    headers={"Accept": "application/json"},
+                    timeout=10.0,
+                )
+                if response.status_code < 400:
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        for key in _ENDPOINT_DEFAULTS:
+                            value = str(payload.get(key, "") or "").strip()
+                            if value:
+                                endpoints[key] = value
+            except (httpx.HTTPError, ValueError):
+                pass
+        _endpoint_cache = endpoints
+        return dict(endpoints)
+
+
+def reset_endpoint_cache() -> None:
+    """Drop the discovery cache; used by tests and after a config change."""
+    global _endpoint_cache
+    with _endpoint_lock:
+        _endpoint_cache = None
 
 
 def build_authorize_url(client_id: str, redirect_uri: str, state: str) -> str:
@@ -67,11 +176,11 @@ def build_authorize_url(client_id: str, redirect_uri: str, state: str) -> str:
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
-            "scope": OAUTH_SCOPES,
+            "scope": oauth_scopes(),
             "state": state,
         }
     )
-    return f"{AUTHORIZE_URL}?{query}"
+    return f"{discover_endpoints()['authorization_endpoint']}?{query}"
 
 
 def exchange_code(
@@ -79,7 +188,7 @@ def exchange_code(
 ) -> dict:
     """Exchange an authorization code for tokens. Never log the response."""
     response = httpx.post(
-        TOKEN_URL,
+        discover_endpoints()["token_endpoint"],
         data={
             "grant_type": "authorization_code",
             "code": code,
@@ -101,7 +210,7 @@ def exchange_code(
 def fetch_userinfo(access_token: str) -> dict:
     try:
         response = httpx.get(
-            USERINFO_URL,
+            discover_endpoints()["userinfo_endpoint"],
             headers={
                 "Authorization": f"Bearer {access_token}",
                 "Accept": "application/json",
