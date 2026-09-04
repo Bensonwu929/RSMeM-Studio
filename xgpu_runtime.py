@@ -8,7 +8,9 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
+import time
 from pathlib import Path
 
 
@@ -80,21 +82,73 @@ def _checksums(models: Path) -> dict[str, str]:
     return values
 
 
-def _download_archive(models: Path, relative: str, workspace: Path) -> Path:
-    from modelscope.hub.file_download import model_file_download
+DOWNLOAD_ATTEMPTS = int(os.getenv("RSMEM_DOWNLOAD_ATTEMPTS", "4"))
+DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("RSMEM_DOWNLOAD_TIMEOUT", "2700"))
 
+# Run the download in a child process so a stalled connection can be killed.
+# A stalled in-process download once held the bootstrap for four hours before
+# the peer reset it, leaving the GPU workers permanently unavailable.
+_DOWNLOAD_SCRIPT = """
+import os, sys
+from modelscope import snapshot_download
+
+repo_id, relative, revision, local_dir = sys.argv[1:5]
+snapshot_download(
+    repo_id=repo_id,
+    repo_type="model",
+    revision=revision,
+    local_dir=local_dir,
+    token=os.getenv("MODELSCOPE_API_TOKEN") or None,
+    allow_file_pattern=[relative],
+)
+"""
+
+
+def _downloaded_archive(download_root: Path, relative: str) -> Path | None:
+    for candidate in (download_root / relative, download_root / Path(relative).name):
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+    return None
+
+
+def _download_archive(models: Path, relative: str, workspace: Path) -> Path:
+    """Fetch one offline archive, retrying on stalls and transport failures."""
     download_root = workspace / ".rsmem-runtime-downloads"
     download_root.mkdir(parents=True, exist_ok=True)
-    downloaded = model_file_download(
-        model_id=os.getenv("RSMEM_MODELSCOPE_MODEL_REPO", "wbx929/RSMeM-Perception-Models"),
-        file_path=relative,
-        revision=os.getenv("RSMEM_MODEL_REVISION", "master"),
-        local_dir=str(download_root),
-        token=os.getenv("MODELSCOPE_API_TOKEN") or None,
+    repo_id = os.getenv("RSMEM_MODELSCOPE_MODEL_REPO", "wbx929/RSMeM-Perception-Models")
+    revision = os.getenv("RSMEM_MODEL_REVISION", "master")
+    reason = "no attempt was made"
+
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        print(
+            f"[xgpu] downloading {relative} (attempt {attempt}/{DOWNLOAD_ATTEMPTS})",
+            flush=True,
+        )
+        try:
+            subprocess.run(
+                [sys.executable, "-c", _DOWNLOAD_SCRIPT,
+                 repo_id, relative, revision, str(download_root)],
+                check=True,
+                timeout=DOWNLOAD_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            reason = f"stalled for more than {DOWNLOAD_TIMEOUT_SECONDS}s"
+        except subprocess.CalledProcessError as exc:
+            reason = f"downloader exited with code {exc.returncode}"
+        else:
+            downloaded = _downloaded_archive(download_root, relative)
+            if downloaded is not None:
+                return downloaded
+            reason = "downloader succeeded but produced no file"
+
+        print(f"[xgpu] download failed for {relative}: {reason}", flush=True)
+        if attempt < DOWNLOAD_ATTEMPTS:
+            time.sleep(min(60, 10 * attempt))
+
+    raise RuntimeError(
+        f"Offline runtime download failed after {DOWNLOAD_ATTEMPTS} attempts "
+        f"for {relative}: {reason}"
     )
-    if not downloaded:
-        raise RuntimeError(f"ModelScope did not return offline archive: {relative}")
-    return Path(downloaded)
 
 
 def ensure_xgpu_runtime_envs(workspace: Path, models: Path) -> dict[str, Path]:

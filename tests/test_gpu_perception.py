@@ -7,6 +7,8 @@ import sys
 import tarfile
 from pathlib import Path
 
+import pytest
+
 import gpu_service_manager as manager
 import model_assets
 import xgpu_runtime
@@ -248,3 +250,53 @@ def test_runtime_downloads_only_missing_archive_and_deletes_it(tmp_path, monkeyp
     assert not (workspace / ".rsmem-runtime-downloads" / "offline").exists() or not any(
         (workspace / ".rsmem-runtime-downloads" / "offline").iterdir()
     )
+
+
+def test_archive_download_retries_after_a_stalled_connection(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    relative = "offline/sam2-py310-cu121-v1.tar.gz"
+    attempts = []
+
+    def fake_run(command, **kwargs):
+        attempts.append(command)
+        if len(attempts) == 1:
+            raise xgpu_runtime.subprocess.TimeoutExpired(command, kwargs["timeout"])
+        target = workspace / ".rsmem-runtime-downloads" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"payload")
+        return None
+
+    monkeypatch.setattr(xgpu_runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(xgpu_runtime.time, "sleep", lambda _seconds: None)
+    resolved = xgpu_runtime._download_archive(tmp_path / "models", relative, workspace)
+    assert len(attempts) == 2
+    assert resolved.read_bytes() == b"payload"
+
+
+def test_archive_download_reports_every_failed_attempt(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    relative = "offline/oea-e3-py310-cu124-v1.tar.gz"
+    attempts = []
+
+    def always_stall(command, **kwargs):
+        attempts.append(command)
+        raise xgpu_runtime.subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(xgpu_runtime.subprocess, "run", always_stall)
+    monkeypatch.setattr(xgpu_runtime.time, "sleep", lambda _seconds: None)
+    with pytest.raises(RuntimeError) as failure:
+        xgpu_runtime._download_archive(tmp_path / "models", relative, workspace)
+    assert len(attempts) == xgpu_runtime.DOWNLOAD_ATTEMPTS
+    assert relative in str(failure.value)
+    assert "stalled" in str(failure.value)
+
+
+def test_archive_download_rejects_a_silent_success(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    relative = "offline/bright-py310-cu121-v1.tar.gz"
+
+    monkeypatch.setattr(xgpu_runtime.subprocess, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(xgpu_runtime.time, "sleep", lambda _seconds: None)
+    with pytest.raises(RuntimeError) as failure:
+        xgpu_runtime._download_archive(tmp_path / "models", relative, workspace)
+    assert "produced no file" in str(failure.value)
