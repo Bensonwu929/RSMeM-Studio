@@ -27,7 +27,7 @@ from PIL import Image
 from rasterio.enums import Resampling
 
 import modelscope_oauth as msoauth
-from gpu_service_manager import start_configured_gpu_services
+from gpu_service_manager import get_gpu_service_manager, start_configured_gpu_services
 
 from mcp_runtime import (
     apparent_thermal_inertia,
@@ -2888,6 +2888,16 @@ def create_app():
                 "set-cookie", f"{msoauth.SESSION_COOKIE}={session_id}{attributes}"
             )
         return response
+
+    @fastapi_app.get("/rsmem/gpu-status")
+    async def gpu_status():
+        """Read-only bootstrap/worker status; no credentials are exposed."""
+        from fastapi.responses import JSONResponse
+
+        manager = get_gpu_service_manager()
+        if manager is None:
+            return JSONResponse({"startup_running": False, "started": {}, "skipped": {}})
+        return JSONResponse(manager.status())
 
     @fastapi_app.get("/oauth/login")
     async def oauth_login(request: Request):

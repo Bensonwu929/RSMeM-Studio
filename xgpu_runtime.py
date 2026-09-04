@@ -43,6 +43,7 @@ def _safe_extract(archive: Path, destination: Path, label: str = "") -> int:
     destination.mkdir(parents=True, exist_ok=True)
     root = destination.resolve()
     started = time.time()
+    last_report = started
     extracted = 0
     with tarfile.open(archive, "r|gz") as bundle:
         for member in bundle:
@@ -51,12 +52,15 @@ def _safe_extract(archive: Path, destination: Path, label: str = "") -> int:
                 raise RuntimeError(f"Unsafe path in offline archive: {member.name}")
             bundle.extract(member, destination, filter="fully_trusted")
             extracted += 1
-            if label and extracted % 5000 == 0:
+            now = time.time()
+            if label and now - last_report >= EXTRACT_PROGRESS_INTERVAL_SECONDS:
+                elapsed = max(now - started, 1e-6)
                 print(
                     f"[xgpu] {label}: extracted {extracted} files "
-                    f"in {time.time() - started:.0f}s",
+                    f"in {elapsed:.0f}s ({extracted / elapsed:.1f} files/s)",
                     flush=True,
                 )
+                last_report = now
     return extracted
 
 
@@ -118,6 +122,9 @@ def _checksums(models: Path) -> dict[str, str]:
 DOWNLOAD_ATTEMPTS = int(os.getenv("RSMEM_DOWNLOAD_ATTEMPTS", "4"))
 DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("RSMEM_DOWNLOAD_TIMEOUT", "2700"))
 CONDA_UNPACK_TIMEOUT_SECONDS = int(os.getenv("RSMEM_CONDA_UNPACK_TIMEOUT", "3600"))
+EXTRACT_PROGRESS_INTERVAL_SECONDS = float(
+    os.getenv("RSMEM_EXTRACT_PROGRESS_INTERVAL", "60")
+)
 
 # Run the download in a child process so a stalled connection can be killed.
 # A stalled in-process download once held the bootstrap for four hours before

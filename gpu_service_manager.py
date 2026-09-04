@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +28,15 @@ RS_ROOT = Path(os.getenv("RSMEM_EARTHBENCH_ROOT", str(WORKSPACE / "RSMeM-public"
 OEA_ROOT = Path(os.getenv("RSMEM_OEA_ROOT", str(WORKSPACE / "OpenEarthAgent")))
 MODELS = Path(os.getenv("RSMEM_MODELS_DIR", str(WORKSPACE / "models")))
 LOG_DIR = Path(os.getenv("RSMEM_GPU_LOG_DIR", str(WORKSPACE / "rsmem-gpu-logs")))
+
+CONTROLLER_NAME = "oea-controller"
+QWEN_NAME = "oea-qwen3-vl"
+OEA_DEPENDENT = frozenset({
+    "oea-grounding-dino",
+    "oea-lae-dino",
+    "oea-ocr",
+    "oea-qwen3-vl",
+})
 
 
 @dataclass(frozen=True)
@@ -79,10 +89,19 @@ def _reachable(spec: ServiceSpec) -> bool:
         return False
 
 
+def _startup_concurrency() -> int:
+    return max(1, int(os.getenv("RSMEM_GPU_STARTUP_CONCURRENCY", "4")))
+
+
+def _startup_timeout_sec() -> int:
+    return int(os.getenv("RSMEM_GPU_STARTUP_TIMEOUT_SEC", "300"))
+
+
 class GPUServiceManager:
     def __init__(self):
         self.processes: dict[str, subprocess.Popen] = {}
         self.skipped: dict[str, str] = {}
+        self.startup_timings: dict[str, float] = {}
         self._lock = threading.Lock()
         self._startup_thread: threading.Thread | None = None
 
@@ -100,6 +119,115 @@ class GPUServiceManager:
         self._startup_thread.start()
         return self
 
+    def _mark_skipped(self, name: str, reason: str) -> None:
+        with self._lock:
+            self.skipped[name] = reason
+
+    def _record_process(self, name: str, process: subprocess.Popen) -> None:
+        with self._lock:
+            self.processes[name] = process
+
+    def _record_timing(self, name: str, seconds: float) -> None:
+        with self._lock:
+            self.startup_timings[name] = seconds
+
+    def _start_one(self, spec: ServiceSpec) -> bool:
+        """Launch one worker and wait until it is healthy. Return True on success."""
+        script = Path(spec.command[1])
+        if not script.is_file():
+            self._mark_skipped(spec.name, f"missing source: {script}")
+            return False
+        missing = [path for path in spec.required_paths if not path.exists()]
+        if missing:
+            self._mark_skipped(
+                spec.name,
+                "missing assets: " + ", ".join(str(path) for path in missing),
+            )
+            return False
+        if _reachable(spec):
+            self._mark_skipped(spec.name, "already running")
+            print(f"[xgpu] {spec.name}: already healthy", flush=True)
+            return True
+
+        log_path = LOG_DIR / f"{spec.name}.log"
+        print(f"[xgpu] {spec.name}: starting; log={log_path}", flush=True)
+        started = time.time()
+        handle = log_path.open("ab", buffering=0)
+        environment = os.environ.copy()
+        environment.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        environment.setdefault("RSMEM_MODELS_DIR", str(MODELS))
+        environment.setdefault("EASYOCR_MODULE_PATH", str(WORKSPACE / "easyocr"))
+        python_paths = [
+            str(RS_ROOT),
+            str(RS_ROOT / "tools" / "deploy_tools"),
+            str(OEA_ROOT),
+            str(MODELS / "GroundingDINO"),
+            str(MODELS / "LAE-DINO" / "mmdetection_lae"),
+        ]
+        if environment.get("PYTHONPATH"):
+            python_paths.append(environment["PYTHONPATH"])
+        environment["PYTHONPATH"] = os.pathsep.join(python_paths)
+        environment.update(dict(spec.environment))
+        process = subprocess.Popen(
+            spec.command,
+            cwd=str(spec.cwd),
+            env=environment,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        self._record_process(spec.name, process)
+
+        wait_seconds = _startup_timeout_sec()
+        for _ in range(wait_seconds):
+            if _reachable(spec):
+                elapsed = time.time() - started
+                self._record_timing(spec.name, elapsed)
+                print(f"[xgpu] {spec.name}: healthy in {elapsed:.0f}s", flush=True)
+                return True
+            if process.poll() is not None:
+                reason = f"exited during startup; see {log_path}"
+                self._mark_skipped(spec.name, reason)
+                print(f"[xgpu] {spec.name}: {reason}", flush=True)
+                return False
+            time.sleep(1)
+
+        reason = f"startup timed out; see {log_path}"
+        self._mark_skipped(spec.name, reason)
+        print(f"[xgpu] {spec.name}: {reason}", flush=True)
+        return False
+
+    def _eligible(self, specs: list[ServiceSpec], selected: set[str]) -> list[ServiceSpec]:
+        eligible = []
+        for spec in specs:
+            if selected and spec.name not in selected:
+                self._mark_skipped(spec.name, "not selected")
+                continue
+            eligible.append(spec)
+        return eligible
+
+    def _start_phase(self, specs: list[ServiceSpec], concurrency: int = 1) -> None:
+        if not specs:
+            return
+        workers = max(1, min(concurrency, len(specs)))
+        if workers == 1:
+            for spec in specs:
+                self._start_one(spec)
+            return
+        print(
+            f"[xgpu] starting {len(specs)} worker(s) with concurrency {workers}",
+            flush=True,
+        )
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(self._start_one, spec): spec.name for spec in specs}
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001 - isolate per-service failures
+                    self._mark_skipped(name, f"{type(exc).__name__}: {exc}")
+                    print(f"[xgpu] {name}: failed: {exc}", flush=True)
+
     def _start_selected_services(self) -> None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         os.environ["RSMEM_ENABLE_GPU_PERCEPTION"] = "1"
@@ -113,77 +241,65 @@ class GPUServiceManager:
                 configure_runtime_environment(interpreters)
                 print("[xgpu] persistent worker environments are ready", flush=True)
         except Exception as exc:
-            self.skipped["asset-bootstrap"] = f"{type(exc).__name__}: {exc}"
+            self._mark_skipped("asset-bootstrap", f"{type(exc).__name__}: {exc}")
             print(f"[xgpu] bootstrap failed: {type(exc).__name__}: {exc}", flush=True)
             return
+
         selected = {
-            item.strip() for item in os.getenv("RSMEM_GPU_SERVICES", "").split(",") if item.strip()
+            item.strip()
+            for item in os.getenv("RSMEM_GPU_SERVICES", "").split(",")
+            if item.strip()
         }
-        for spec in service_specs():
-            if selected and spec.name not in selected:
-                self.skipped[spec.name] = "not selected"
-                continue
-            script = Path(spec.command[1])
-            if not script.is_file():
-                self.skipped[spec.name] = f"missing source: {script}"
-                continue
-            missing = [path for path in spec.required_paths if not path.exists()]
-            if missing:
-                self.skipped[spec.name] = "missing assets: " + ", ".join(str(path) for path in missing)
-                continue
-            if _reachable(spec):
-                self.skipped[spec.name] = "already running"
-                print(f"[xgpu] {spec.name}: already healthy", flush=True)
-                continue
-            log_path = LOG_DIR / f"{spec.name}.log"
-            print(f"[xgpu] {spec.name}: starting; log={log_path}", flush=True)
-            handle = log_path.open("ab", buffering=0)
-            environment = os.environ.copy()
-            environment.setdefault("CUDA_VISIBLE_DEVICES", "0")
-            environment.setdefault("RSMEM_MODELS_DIR", str(MODELS))
-            environment.setdefault("EASYOCR_MODULE_PATH", str(WORKSPACE / "easyocr"))
-            python_paths = [
-                str(RS_ROOT),
-                str(RS_ROOT / "tools" / "deploy_tools"),
-                str(OEA_ROOT),
-                str(MODELS / "GroundingDINO"),
-                str(MODELS / "LAE-DINO" / "mmdetection_lae"),
-            ]
-            if environment.get("PYTHONPATH"):
-                python_paths.append(environment["PYTHONPATH"])
-            environment["PYTHONPATH"] = os.pathsep.join(python_paths)
-            environment.update(dict(spec.environment))
-            process = subprocess.Popen(
-                spec.command,
-                cwd=str(spec.cwd),
-                env=environment,
-                stdout=handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            self.processes[spec.name] = process
-            wait_seconds = int(os.getenv("RSMEM_GPU_STARTUP_TIMEOUT_SEC", "300"))
-            for _ in range(wait_seconds):
-                if _reachable(spec):
-                    print(f"[xgpu] {spec.name}: healthy", flush=True)
-                    break
-                if process.poll() is not None:
-                    self.skipped[spec.name] = f"exited during startup; see {log_path}"
-                    print(f"[xgpu] {spec.name}: exited during startup; see {log_path}", flush=True)
-                    break
-                time.sleep(1)
-            else:
-                self.skipped[spec.name] = f"startup timed out; see {log_path}"
-                print(f"[xgpu] {spec.name}: startup timed out; see {log_path}", flush=True)
+        by_name = {spec.name: spec for spec in self._eligible(service_specs(), selected)}
+
+        # Phase A: controller must be healthy before any OEA worker can report in.
+        controller = by_name.pop(CONTROLLER_NAME, None)
+        controller_ok = True
+        if controller is not None:
+            print("[xgpu] phase A: starting controller", flush=True)
+            controller_ok = self._start_one(controller)
+            if not controller_ok:
+                for name in list(by_name):
+                    if name in OEA_DEPENDENT:
+                        self._mark_skipped(name, "controller unavailable")
+                        by_name.pop(name, None)
+                        print(
+                            f"[xgpu] {name}: skipped because controller is unavailable",
+                            flush=True,
+                        )
+
+        # Phase B: remaining light workers in parallel (excludes the large VLM).
+        qwen = by_name.pop(QWEN_NAME, None)
+        phase_b = list(by_name.values())
+        if phase_b:
+            print(f"[xgpu] phase B: starting {len(phase_b)} worker(s)", flush=True)
+            self._start_phase(phase_b, concurrency=_startup_concurrency())
+
+        # Phase C: load Qwen3-VL last to keep GPU memory peaks predictable.
+        if qwen is not None:
+            print("[xgpu] phase C: starting Qwen3-VL", flush=True)
+            self._start_one(qwen)
+
+        timings = ", ".join(
+            f"{name}={seconds:.0f}s"
+            for name, seconds in sorted(self.startup_timings.items())
+        )
+        if timings:
+            print(f"[xgpu] worker startup timings: {timings}", flush=True)
 
     def status(self) -> dict:
-        return {
-            "workspace": str(WORKSPACE),
-            "started": {
+        with self._lock:
+            started = {
                 name: {"pid": process.pid, "running": process.poll() is None}
                 for name, process in self.processes.items()
-            },
-            "skipped": dict(self.skipped),
+            }
+            skipped = dict(self.skipped)
+            timings = dict(self.startup_timings)
+        return {
+            "workspace": str(WORKSPACE),
+            "started": started,
+            "skipped": skipped,
+            "startup_timings": timings,
             "log_dir": str(LOG_DIR),
             "startup_running": bool(self._startup_thread and self._startup_thread.is_alive()),
         }
@@ -203,4 +319,8 @@ def start_configured_gpu_services() -> GPUServiceManager:
     if _MANAGER is None:
         _MANAGER = GPUServiceManager().start()
         atexit.register(_MANAGER.stop)
+    return _MANAGER
+
+
+def get_gpu_service_manager() -> GPUServiceManager | None:
     return _MANAGER

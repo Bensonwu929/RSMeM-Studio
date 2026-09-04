@@ -125,6 +125,47 @@ short-lived tool session dies with that session and produces
 `ERR_CONNECTION_REFUSED`, which is a local lifecycle artifact rather than
 evidence of a deployment failure.
 
+### Deployment cost breakdown (measured 2026-09-04)
+
+Steady-state redeploys are fast once offline runtimes are cached on the
+persistent volume. Measured on ModelScope xGPU:
+
+```text
+Container start → pip → app import → asset validation ready   ≈ 56 s
+One-time offline runtime download + extract (six envs)        hours (once)
+GPU worker startup (nine services)                            minutes (every deploy)
+```
+
+The one-time cost is writing tens of thousands of small files to
+`/mnt/workspace`. Per-file create latency on that volume was measured around
+240 ms, so decompression itself is not the bottleneck. After each env has a
+matching `.rsmem-runtime.json` marker (`schema`, `archive`, `sha256`), later
+deploys skip extraction entirely.
+
+Worker startup is staged: controller first, then light workers in parallel
+(`RSMEM_GPU_STARTUP_CONCURRENCY`, default 4), then Qwen3-VL alone to keep
+VRAM peaks predictable. Read-only status without relying on platform logs:
+
+```text
+GET /rsmem/gpu-status
+```
+
+Relevant knobs:
+
+```text
+RSMEM_DOWNLOAD_ATTEMPTS              default 4
+RSMEM_DOWNLOAD_TIMEOUT               default 2700 s
+RSMEM_ENV_EXTRACT_WORKERS            default 6
+RSMEM_EXTRACT_PROGRESS_INTERVAL      default 60 s
+RSMEM_CONDA_UNPACK_TIMEOUT           default 3600 s
+RSMEM_GPU_STARTUP_CONCURRENCY        default 4
+RSMEM_GPU_STARTUP_TIMEOUT_SEC        default 300
+```
+
+The ModelScope `/logs/run` window can freeze while the container still serves
+HTTP 200. Prefer `/rsmem/gpu-status` or an `mcp_health` field from a real run
+over the platform log stream when diagnosing bootstrap.
+
 ## 4. Development conventions
 
 ### Push is deployment
@@ -490,7 +531,15 @@ environment variables and callback URLs rather than removing the quota mode.
 
 GPU services may be intentionally disabled locally. CPU mode must remain
 functional. Perception tools must only appear when workers pass health checks.
-Do not silently substitute fabricated vision outputs.
+Do not silently substitute fabricated vision outputs. Worker image writers
+(for example ChangeOS `cv2.imwrite`) must raise when the write fails; never
+report success for a missing artifact.
+
+Offline runtimes expand from the private ModelScope model repository. Do not
+reintroduce runtime `git clone` or `pip install` for those workers. A deploy
+that interrupts an in-progress first-time extract forces the long expansion to
+restart; prefer waiting for `/rsmem/gpu-status` to show workers healthy before
+pushing further GPU bootstrap changes.
 
 ### OpenAI-compatible tool calling
 

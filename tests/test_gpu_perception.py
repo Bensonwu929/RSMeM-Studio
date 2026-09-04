@@ -376,3 +376,175 @@ def test_archive_download_rejects_a_silent_success(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError) as failure:
         xgpu_runtime._download_archive(tmp_path / "models", relative, workspace)
     assert "produced no file" in str(failure.value)
+
+
+def _service(name: str, path: Path) -> manager.ServiceSpec:
+    source = path / f"{name}.py"
+    source.write_text("pass\n", encoding="utf-8")
+    return manager.ServiceSpec(
+        name,
+        (sys.executable, str(source)),
+        path,
+        f"http://127.0.0.1:9/{name}",
+    )
+
+
+def test_controller_failure_skips_oea_workers(tmp_path, monkeypatch):
+    specs = [
+        _service("earthbench-sam2", tmp_path),
+        _service("oea-controller", tmp_path),
+        _service("oea-ocr", tmp_path),
+        _service("oea-qwen3-vl", tmp_path),
+    ]
+    started = []
+
+    def fake_start(self, spec):
+        started.append(spec.name)
+        if spec.name == "oea-controller":
+            self._mark_skipped(spec.name, "startup timed out")
+            return False
+        self._record_timing(spec.name, 0.1)
+        return True
+
+    monkeypatch.setattr(manager, "service_specs", lambda: specs)
+    monkeypatch.setattr(manager, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(manager, "prepare_xgpu_assets", lambda *_args: None)
+    monkeypatch.setenv("RSMEM_GPU_BOOTSTRAP_ENVS", "0")
+    monkeypatch.setenv("RSMEM_ENABLE_GPU_PERCEPTION", "0")
+    monkeypatch.setattr(manager.GPUServiceManager, "_start_one", fake_start)
+
+    instance = manager.GPUServiceManager()
+    instance._start_selected_services()
+    assert "oea-controller" in started
+    assert "earthbench-sam2" in started
+    assert "oea-ocr" not in started
+    assert "oea-qwen3-vl" not in started
+    assert instance.skipped["oea-ocr"] == "controller unavailable"
+    assert instance.skipped["oea-qwen3-vl"] == "controller unavailable"
+
+
+def test_phase_b_starts_workers_concurrently(tmp_path, monkeypatch):
+    import threading
+
+    specs = [
+        _service("oea-controller", tmp_path),
+        _service("earthbench-sam2", tmp_path),
+        _service("earthbench-remoteclip", tmp_path),
+        _service("oea-ocr", tmp_path),
+        _service("oea-qwen3-vl", tmp_path),
+    ]
+    order = []
+    barrier = threading.Barrier(3, timeout=5)
+
+    def fake_start(self, spec):
+        if spec.name == "oea-controller":
+            order.append(("controller", spec.name))
+            return True
+        if spec.name == "oea-qwen3-vl":
+            order.append(("qwen", spec.name))
+            return True
+        barrier.wait()
+        order.append(("phase_b", spec.name))
+        return True
+
+    monkeypatch.setattr(manager, "service_specs", lambda: specs)
+    monkeypatch.setattr(manager, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(manager, "prepare_xgpu_assets", lambda *_args: None)
+    monkeypatch.setenv("RSMEM_GPU_BOOTSTRAP_ENVS", "0")
+    monkeypatch.setenv("RSMEM_ENABLE_GPU_PERCEPTION", "0")
+    monkeypatch.setenv("RSMEM_GPU_STARTUP_CONCURRENCY", "3")
+    monkeypatch.setattr(manager.GPUServiceManager, "_start_one", fake_start)
+
+    instance = manager.GPUServiceManager()
+    instance._start_selected_services()
+    assert order[0] == ("controller", "oea-controller")
+    assert order[-1] == ("qwen", "oea-qwen3-vl")
+    assert {item[1] for item in order[1:-1]} == {
+        "earthbench-sam2", "earthbench-remoteclip", "oea-ocr"
+    }
+
+
+def test_single_worker_failure_does_not_abort_siblings(tmp_path, monkeypatch):
+    specs = [
+        _service("oea-controller", tmp_path),
+        _service("earthbench-sam2", tmp_path),
+        _service("earthbench-changeos", tmp_path),
+        _service("oea-qwen3-vl", tmp_path),
+    ]
+
+    def fake_start(self, spec):
+        if spec.name == "earthbench-changeos":
+            self._mark_skipped(spec.name, "startup timed out")
+            return False
+        self._record_timing(spec.name, 0.2)
+        return True
+
+    monkeypatch.setattr(manager, "service_specs", lambda: specs)
+    monkeypatch.setattr(manager, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(manager, "prepare_xgpu_assets", lambda *_args: None)
+    monkeypatch.setenv("RSMEM_GPU_BOOTSTRAP_ENVS", "0")
+    monkeypatch.setenv("RSMEM_ENABLE_GPU_PERCEPTION", "0")
+    monkeypatch.setenv("RSMEM_GPU_STARTUP_CONCURRENCY", "2")
+    monkeypatch.setattr(manager.GPUServiceManager, "_start_one", fake_start)
+
+    instance = manager.GPUServiceManager()
+    instance._start_selected_services()
+    assert "startup timed out" in instance.skipped["earthbench-changeos"]
+    assert "earthbench-sam2" in instance.startup_timings
+    assert "oea-qwen3-vl" in instance.startup_timings
+
+
+def test_extraction_progress_is_time_driven(tmp_path, monkeypatch, capsys):
+    archive = tmp_path / "demo.tar.gz"
+    with tarfile.open(archive, "w:gz") as bundle:
+        for index in range(3):
+            payload = b"x"
+            info = tarfile.TarInfo(f"file-{index}")
+            info.size = len(payload)
+            bundle.addfile(info, io.BytesIO(payload))
+
+    clock = {"now": 1000.0}
+
+    def fake_time():
+        clock["now"] += 30.0
+        return clock["now"]
+
+    monkeypatch.setattr(xgpu_runtime, "EXTRACT_PROGRESS_INTERVAL_SECONDS", 60.0)
+    monkeypatch.setattr(xgpu_runtime.time, "time", fake_time)
+    extracted = xgpu_runtime._safe_extract(archive, tmp_path / "out", label="demo")
+    assert extracted == 3
+    captured = capsys.readouterr().out
+    assert "files/s" in captured
+    assert "demo: extracted" in captured
+
+
+def test_changeos_override_refuses_silent_imwrite_failure():
+    source = Path(__file__).resolve().parents[1] / "xgpu_workers" / "changeos_api.py"
+    text = source.read_text(encoding="utf-8")
+    assert "if not cv2.imwrite" in text
+    assert "refusing to report success" in text
+
+
+def test_gpu_status_endpoint_exposes_manager_state(monkeypatch):
+    import app as studio_app
+    from fastapi.testclient import TestClient
+
+    class FakeManager:
+        def status(self):
+            return {
+                "workspace": "/mnt/workspace",
+                "started": {"oea-controller": {"pid": 1, "running": True}},
+                "skipped": {},
+                "startup_timings": {"oea-controller": 1.5},
+                "log_dir": "/tmp/logs",
+                "startup_running": False,
+            }
+
+    monkeypatch.setattr(studio_app, "get_gpu_service_manager", lambda: FakeManager())
+    monkeypatch.setenv("RSMEM_GPU_AUTOSTART", "0")
+    client = TestClient(studio_app.create_app())
+    response = client.get("/rsmem/gpu-status")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["started"]["oea-controller"]["running"] is True
+    assert payload["startup_timings"]["oea-controller"] == 1.5

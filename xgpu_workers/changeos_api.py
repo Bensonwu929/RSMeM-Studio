@@ -154,7 +154,14 @@ async def changeos_infer(request: ChangeOSRequest) -> ChangeOSResponse:
         visualization = cv2.resize(visualization, original_size, interpolation=cv2.INTER_NEAREST)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(output_path), visualization)
+        if not cv2.imwrite(str(output_path), visualization):
+            raise RuntimeError(
+                f"cv2.imwrite failed for {output_path}; refusing to report success"
+            )
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise RuntimeError(
+                f"ChangeOS wrote no output at {output_path}; refusing to report success"
+            )
 
         total_time = (datetime.now() - started).total_seconds()
         return ChangeOSResponse(
