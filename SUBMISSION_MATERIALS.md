@@ -4,16 +4,16 @@
 
 RSMeM: Knowledge-Enhanced Memory Evolution for Remote Sensing Agents
 
-## Project abstract (66 words)
+## Project abstract (73 words)
 
-RSMeM is a knowledge-enhanced memory evolution framework for reliable remote
-sensing agents. It combines Hierarchical Knowledge Grounding, which retrieves
-structured geoscience knowledge for tool planning, with Failure-Aware Experience
-Refinement, which converts failed trajectories into reusable execution
-constraints. The public Studio demonstrates the complete
-retrieve-plan-execute-judge-reflect-confirm-retry loop on thirteen remote-sensing cases. Its
-CPU-only raster toolchain produces auditable GeoTIFF outputs and supports
-visitor-provided OpenAI-compatible models without storing API credentials.
+RSMeM is a knowledge-enhanced memory evolution mechanism that bootstraps
+remote-sensing agents with pre-distilled domain knowledge and iteratively
+integrates online experience for robust multi-step tool execution. Hierarchical
+Knowledge Grounding performs taxonomy-aware retrieval over a hierarchical domain
+corpus to guide planning and tool selection; Failure-Aware Experience Refinement
+distills failure-annotated tool-use traces into reusable constraints for the
+next round of execution. On EarthBench, RSMeM consistently improves tool use and
+end-to-end answer accuracy across diverse LLM backbones.
 
 ## Public links
 

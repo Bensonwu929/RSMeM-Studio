@@ -447,13 +447,52 @@ def test_run_tab_is_primary_and_overview_content_is_progressively_disclosed():
         if component.get("type") == "html"
     ]
     assert any(
-        "end-to-end Earth-observation analysis agent" in value
+        "end-to-end Earth observation agent" in value
         for value in html_values
     )
     assert not any("From remote-sensing imagery to verified answers" in value for value in html_values)
     assert any(
         component.get("props", {}).get("label") == "Method overview and paper figures"
         for component in config["components"]
+    )
+
+
+def test_input_card_and_submission_tab_carry_no_redundant_copy():
+    config = app.demo.get_config_file()
+    markdown_values = [
+        str(component.get("props", {}).get("value", ""))
+        for component in config["components"]
+        if component.get("type") == "markdown"
+    ]
+    assert not any("Write your own task and attach" in value for value in markdown_values)
+    assert not any("Required public links" in value for value in markdown_values)
+    assert not any("The Learn article documents" in value for value in markdown_values)
+
+    labels = [
+        component.get("props", {}).get("label") for component in config["components"]
+    ]
+    assert "Query" in labels
+    assert "Your remote-sensing query" not in labels
+
+
+def test_submission_abstract_follows_the_paper_and_states_its_own_length():
+    assert "Hierarchical Knowledge Grounding" in app.PROJECT_ABSTRACT
+    assert "Failure-Aware Experience Refinement" in app.PROJECT_ABSTRACT
+    assert "EarthBench" in app.PROJECT_ABSTRACT
+    # The Studio's own implementation details belong in the UI, not the abstract.
+    assert "Studio" not in app.PROJECT_ABSTRACT
+    assert "MCP" not in app.PROJECT_ABSTRACT
+
+    config = app.demo.get_config_file()
+    markdown_values = [
+        str(component.get("props", {}).get("value", ""))
+        for component in config["components"]
+        if component.get("type") == "markdown"
+    ]
+    assert any(
+        f"### Project abstract ({app.PROJECT_ABSTRACT_WORDS} words)" in value
+        and app.PROJECT_ABSTRACT in value
+        for value in markdown_values
     )
 
 

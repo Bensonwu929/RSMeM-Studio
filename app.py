@@ -80,14 +80,15 @@ CASE_REFERENCE_PATH = ROOT / "case_references.json"
 
 PROJECT_TITLE = "RSMeM: Knowledge-Enhanced Memory Evolution for Remote Sensing Agents"
 PROJECT_ABSTRACT = (
-    "RSMeM is a knowledge-enhanced memory evolution framework for reliable remote sensing agents. "
-    "It combines Hierarchical Knowledge Grounding, which retrieves structured geoscience knowledge "
-    "for tool planning, with Failure-Aware Experience Refinement, which converts failed trajectories "
-    "into reusable execution constraints. The public Studio implements the complete "
-    "retrieve-plan-execute-judge-reflect-confirm-retry loop on thirteen remote-sensing cases. Its MCP toolchain "
-    "combines auditable raster operations with health-gated GPU perception and supports visitor-provided "
-    "models without storing API credentials."
+    "RSMeM is a knowledge-enhanced memory evolution mechanism that bootstraps remote-sensing "
+    "agents with pre-distilled domain knowledge and iteratively integrates online experience "
+    "for robust multi-step tool execution. Hierarchical Knowledge Grounding performs "
+    "taxonomy-aware retrieval over a hierarchical domain corpus to guide planning and tool "
+    "selection; Failure-Aware Experience Refinement distills failure-annotated tool-use traces "
+    "into reusable constraints for the next round of execution. On EarthBench, RSMeM "
+    "consistently improves tool use and end-to-end answer accuracy across diverse LLM backbones."
 )
+PROJECT_ABSTRACT_WORDS = len(PROJECT_ABSTRACT.split())
 GITHUB_URL = "https://github.com/AI9Stars/RSMeM"
 LEARN_URL = "https://modelscope.cn/learn/435887"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
@@ -2448,7 +2449,7 @@ footer {visibility:hidden; height:0;}
 
 with gr.Blocks(title=PROJECT_TITLE) as demo:
     gr.HTML(
-        "<div class='hero'><h1>🛰️ RSMeM — A real end-to-end Earth-observation analysis agent</h1></div>"
+        "<div class='hero'><h1>🛰️ RSMeM — A real end-to-end Earth observation agent</h1></div>"
     )
 
     with gr.Tab("Run RSMeM"):
@@ -2457,12 +2458,11 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
 
         with gr.Group(elem_id="input-card"):
             gr.Markdown(
-                "### What do you want RSMeM to analyze?\n"
-                "Write your own task and attach GeoTIFF, TIFF, PNG, or JPEG imagery, or load a prepared case below.",
+                "### What do you want RSMeM to analyze?",
                 elem_classes=["card-heading"],
             )
             query_input = gr.Textbox(
-                label="Your remote-sensing query",
+                label="Query",
                 value="",
                 placeholder=(
                     "Example: compare the mean nighttime-light intensity of the two "
@@ -2822,30 +2822,15 @@ If RSMeM supports your research, please cite the arXiv paper:
             gr.Image("assets/figure2.png", label="RSMeM workflow")
 
     with gr.Tab("Challenge submission"):
-        learn_submission = (
-            f"[{LEARN_URL}]({LEARN_URL})"
-            if LEARN_URL
-            else "**Pending — paste the public article URL after publishing `LEARN_ARTICLE.md`.**"
-        )
         gr.Markdown(
             f"""
 ### Project title
 
 **{PROJECT_TITLE}**
 
-### Project abstract (66 words)
+### Project abstract ({PROJECT_ABSTRACT_WORDS} words)
 
 {PROJECT_ABSTRACT}
-
-### Required public links
-
-- **ModelScope Studio:** [https://modelscope.cn/studios/wbx929/RSMeM](https://modelscope.cn/studios/wbx929/RSMeM)
-- **ModelScope Learn article:** {learn_submission}
-- **Open-source repository:** [{GITHUB_URL}]({GITHUB_URL})
-
-The Learn article documents the research question, EarthBench data, model configuration,
-RSMeM workflow, system design, reproducibility safeguards, paper evaluation, and the thirteen
-CPU demonstration results.
             """
         )
 
