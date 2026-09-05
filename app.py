@@ -5,8 +5,8 @@ from __future__ import annotations
 import ast
 import copy
 import html as html_lib
-import json
 import ipaddress
+import json
 import os
 import re
 import secrets
@@ -24,11 +24,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from openai import OpenAI
 from PIL import Image
-from rasterio.enums import Resampling
+from rasterio.enums import ColorInterp, Resampling
 
 import modelscope_oauth as msoauth
+from cpu_tools import infer_band_roles
+from deterministic_evaluator import evaluate_case_deterministically
 from gpu_service_manager import get_gpu_service_manager, start_configured_gpu_services
-
 from mcp_runtime import (
     apparent_thermal_inertia,
     calc_batch_image_mean,
@@ -38,11 +39,13 @@ from mcp_runtime import (
     calculate_ndwi,
     calculate_threshold_ratio,
     calculate_turbidity,
+    call_workflow_tool,
     combine_binary_masks,
     compute_tvdi,
     consecutive_percentage_changes,
     create_below_threshold_mask,
     create_threshold_mask,
+    discover_workflow_tools,
     fire_prone_mask,
     hotspot_direction,
     inspect_rasters,
@@ -53,25 +56,41 @@ from mcp_runtime import (
     raster_skewness,
     sens_slope,
     subtract_rasters,
-    difference as mcp_difference,
-    max_three_day_window as mcp_max_three_day_window,
-    max_value_and_index as mcp_max_value_and_index,
-    validate_inputs as mcp_validate_inputs,
-    validate_result as mcp_validate_result,
-    call_workflow_tool,
-    discover_workflow_tools,
     workflow_mcp,
 )
-from cpu_tools import infer_band_roles
+from mcp_runtime import (
+    difference as mcp_difference,
+)
+from mcp_runtime import (
+    max_three_day_window as mcp_max_three_day_window,
+)
+from mcp_runtime import (
+    max_value_and_index as mcp_max_value_and_index,
+)
+from mcp_runtime import (
+    validate_inputs as mcp_validate_inputs,
+)
+from mcp_runtime import (
+    validate_result as mcp_validate_result,
+)
+from react_harness import MAX_MODEL_CALLS_PER_ATTEMPT, run_react_attempt
+from studio_ui import (
+    CSS,
+    ENGLISH_CONTROLS,
+    FOOTER,
+    NAV,
+    WALKTHROUGH_JS,
+    WORKSPACE_HEADING,
+    hero_html,
+    language_script,
+    walkthrough_html,
+)
 from workflow_logic import (
     generate_reflection_candidates,
     judge_builtin_case,
     synthesize_answer,
     teacher_failure_gate,
 )
-from deterministic_evaluator import evaluate_case_deterministically
-from react_harness import MAX_MODEL_CALLS_PER_ATTEMPT, run_react_attempt
-
 
 ROOT = Path(__file__).resolve().parent
 GPU_SERVICE_MANAGER = start_configured_gpu_services()
@@ -531,7 +550,7 @@ def _normalize_preview_band(array: np.ndarray) -> np.ndarray:
 
 
 def raster_preview(paths) -> np.ndarray | None:
-    """Build a lightweight CPU preview without changing the source rasters."""
+    """Fit the first image to a display thumbnail without mixing separate rasters."""
     raster_paths = [
         Path(item) if isinstance(item, (str, os.PathLike)) else Path(item.name)
         for item in (paths or [])
@@ -548,18 +567,21 @@ def raster_preview(paths) -> np.ndarray | None:
         image.thumbnail((640, 640))
         return np.asarray(image)
 
-    channels = []
-    target_height = target_width = None
-    for path in raster_paths[:3]:
-        with rasterio.open(path) as src:
-            scale = min(1.0, 640 / max(src.height, src.width))
-            height = max(1, int(src.height * scale))
-            width = max(1, int(src.width * scale))
-            if target_height is None:
-                target_height, target_width = height, width
+    with rasterio.open(raster_paths[0]) as src:
+        scale = min(1.0, 640 / max(src.height, src.width))
+        height = max(1, round(src.height * scale))
+        width = max(1, round(src.width * scale))
+        rgb_roles = (ColorInterp.red, ColorInterp.green, ColorInterp.blue)
+        # Use true RGB metadata when available, otherwise show band 1 in gray.
+        bands = (
+            [src.colorinterp.index(role) + 1 for role in rgb_roles]
+            if all(role in src.colorinterp for role in rgb_roles) else [1]
+        )
+        channels = []
+        for index in bands:
             band = src.read(
-                1,
-                out_shape=(target_height, target_width),
+                index,
+                out_shape=(height, width),
                 masked=True,
                 resampling=Resampling.bilinear,
             ).astype(np.float32).filled(np.nan)
@@ -567,9 +589,7 @@ def raster_preview(paths) -> np.ndarray | None:
 
     if len(channels) == 1:
         return np.repeat(channels[0][..., None], 3, axis=2)
-    if len(channels) == 2:
-        channels.append(np.round((channels[0].astype(float) + channels[1]) / 2).astype(np.uint8))
-    return np.stack(channels[:3], axis=2)
+    return np.stack(channels, axis=2)
 
 
 def preview_uploaded_rasters(uploaded_files):
@@ -583,6 +603,25 @@ def load_example(example_name: str):
     directory = ROOT / "examples" / example["directory"] if example["directory"] else None
     paths = sorted(directory.glob("*.tif")) if directory and directory.is_dir() else []
     return (example["query"], raster_preview(paths))
+
+
+def load_example_for_ui(example_name: str):
+    """A deliberate case selection replaces any previously uploaded source."""
+    query, preview = load_example(example_name)
+    return query, preview, None
+
+
+def select_uploaded_source(uploaded_files, example_name: str):
+    """Keep the preview and execution source in sync on upload and clear."""
+    if uploaded_files:
+        return preview_uploaded_rasters(uploaded_files), gr.update(value=None)
+    preview = load_example(example_name)[1] if example_name else None
+    return preview, gr.skip()
+
+
+def load_quick_case(example_name: str):
+    query, preview, uploads = load_example_for_ui(example_name)
+    return example_name, query, preview, uploads
 
 
 def prepare_rasters(uploaded_files, run_dir: Path, example_name: str) -> tuple[list[str], str]:
@@ -1757,7 +1796,10 @@ def _attempts_interactive_html(state: dict) -> str:
                 '<details class="step-card">'
                 f'<summary><span class="num">{_esc(step["step"])}</span>'
                 f'<code>{_esc(step["tool"])}</code>{badge}</summary>'
-                f'<div class="step-obs">{_esc(step["observation"])}</div>'
+                '<div class="step-obs"><strong>Inputs</strong>\n'
+                f'{_esc(json.dumps(step.get("parameters", {}), ensure_ascii=False, indent=2))}'
+                '\n\n<strong>Observation</strong>\n'
+                f'{_esc(step["observation"])}</div>'
                 "</details>"
             )
         sections.append(
@@ -2174,7 +2216,7 @@ def _ms_status_html(session_id: str | None) -> tuple[str, bool]:
         user = _esc(session.get("user", "ModelScope user"))
         return (
             '<div class="auth-box connected"><div class="st ok"><span class="dot">●</span> '
-            f"Signed in as <b>{user}</b> · runs use your own API-Inference quota</div>"
+            f'Signed in as <b data-no-translate>{user}</b> · runs use your own API-Inference quota</div>'
             "<p>The token stays in this browser session only and is never stored "
             "by the Studio. Requires an Alibaba Cloud-bound, real-name verified "
             "ModelScope account.</p></div>",
@@ -2280,203 +2322,51 @@ def confirm_reflection_and_retry_ui(
     )
 
 
-CSS = """
-/* Codex-inspired neutral system: single column, one border per card. */
-.gradio-container {
-  --background-fill-primary: #f7f7f7;
-  --background-fill-secondary: #ffffff;
-  --block-background-fill: #ffffff;
-  --block-border-color: #e3e3e3;
-  --block-title-text-color: #242424;
-  --body-text-color: #242424;
-  --body-text-color-subdued: #737373;
-  --input-background-fill: #ffffff;
-  --input-border-color: #dddddd;
-  --block-title-background-fill: transparent;
-  --block-label-background-fill: transparent;
-  --block-title-text-color: #242424;
-  --block-label-text-color: #555555;
-  --button-primary-background-fill: #202020;
-  --button-primary-background-fill-hover: #333333;
-  --button-primary-text-color: #ffffff;
-  --color-accent: #202020;
-  background:#f7f7f7 !important;
-  color:#242424 !important;
-  max-width:none !important;
-  padding:0 !important;
-}
-.gradio-container > .main {max-width:1020px !important; margin:0 auto !important; padding:0 22px 40px !important;}
-.gradio-container a {color:#444444 !important;}
-.hero {display:block; text-align:center; padding:24px 0 10px;}
-.hero h1 {font-size:22px !important; line-height:1.3 !important; margin:0 !important; letter-spacing:-.02em;}
-.hero p {margin:6px auto 0 !important; color:#737373; font-size:13px; max-width:760px;}
-.note {border-left:3px solid #262626; padding:.75rem 1rem; background:#f1f1f1;}
-#method-overview {margin-top:14px; border:1px solid #dedede !important; border-radius:12px !important; background:#fafafa !important;}
-#method-overview > button {font-weight:700 !important; color:#242424 !important;}
-
-/* Cards: input + model service */
-#input-card, #model-service {background:#ffffff !important; border:1px solid #e3e3e3 !important; border-radius:14px !important; padding:18px 20px !important; margin-top:14px;}
-#input-card .form, #model-service .form, #input-card .styler, #model-service .styler {background:transparent !important; border:none !important; box-shadow:none !important;}
-.card-heading, .upload-heading, .section-title {background:transparent !important; border:none !important; box-shadow:none !important; padding:0 !important;}
-.card-heading h3 {font-size:15px !important; margin:0 0 2px !important;}
-.card-heading p {font-size:12.5px !important; color:#737373 !important; margin:0 0 10px !important;}
-#attach-row {gap:14px !important; margin-top:4px;}
-.upload-heading p {font-size:12.5px !important; color:#555555 !important; margin:0 0 6px !important;}
-#raster-upload {border:1px dashed #bdbdbd !important; border-radius:10px !important; background:#fcfcfc !important; min-height:150px;}
-#raster-upload:hover {border-color:#8a8a8a !important;}
-#raster-preview {border-radius:10px !important; overflow:hidden !important; background:#f1f1f1 !important;}
-#raster-preview img {object-fit:contain !important;}
-#example-picker {border:1px solid #e3e3e3 !important; border-radius:10px !important; background:#fafafa !important; margin-top:12px;}
-#example-picker > button {font-weight:650 !important; color:#242424 !important;}
-
-/* Connection mode segmented control */
-#connection-mode {border:0 !important; background:transparent !important; padding:0 !important;}
-#connection-mode .wrap {display:flex !important; gap:0 !important; border:1px solid #d4d4d4; border-radius:10px; overflow:hidden; flex-wrap:nowrap !important; background:transparent;}
-#connection-mode label {flex:1 1 50%; margin:0 !important; border-radius:0 !important; padding:11px 16px !important; background:#fafafa !important; border:0 !important; font-weight:600; justify-content:center;}
-#connection-mode label, #connection-mode label span {color:#242424 !important;}
-#connection-mode label + label {border-left:1px solid #d4d4d4 !important;}
-#connection-mode label.selected, #connection-mode label:has(input:checked) {background:#ffffff !important; box-shadow:inset 0 -3px 0 #202020 !important;}
-#connection-mode label.selected span, #connection-mode label:has(input:checked) span {color:#242424 !important; font-weight:700;}
-#connection-mode input[type=radio] {position:absolute; opacity:0; pointer-events:none;}
-#ms-pane, #oa-pane {border:0 !important; box-shadow:none !important; background:transparent !important; padding:0 !important; margin-top:12px;}
-.auth-box {border-left:3px solid #d4d4d4; background:#fafafa; border-radius:0 8px 8px 0; padding:12px 16px;}
-.auth-box .st {font-weight:600; font-size:13px;}
-.auth-box .st .dot {color:#9a9a9a; margin-right:4px;}
-.auth-box .st.ok .dot {color:#18794e;}
-.auth-box p {font-size:12.5px; color:#737373; margin:4px 0 0;}
-.auth-box .ms-signin {display:block; margin-top:12px; background:#202020; color:#ffffff !important; text-align:center; font-weight:650; border-radius:9px; padding:11px 18px; text-decoration:none;}
-.auth-box .ms-signin:hover {background:#333333;}
-.auth-box p.auth-hint {font-size:11.5px; color:#8f8f8f; margin-top:8px; word-break:break-all;}
-#ms-refresh, #ms-signout {max-width:220px;}
-
-/* Run button: strong but not full-bleed */
-#run-row {justify-content:center !important; margin-top:16px;}
-#run-rsmem-button {flex:0 1 340px !important; min-width:260px !important; min-height:46px !important; font-weight:700 !important;}
-
-/* Progress strip */
-#workflow-status {margin-top:14px; background:#ffffff !important; border:1px solid #dedede !important; border-radius:12px !important; padding:12px 14px !important;}
-#workflow-status .prose {font-size:14px !important; color:#555555;}
-#workflow-status h3 {font-size:16px !important; margin:0 0 5px !important; color:#242424;}
-#workflow-timeline {border:0 !important; background:transparent !important; padding:0 !important;}
-.run-progress-panel {background:#ffffff; border:1px solid #d7d7d7; border-radius:12px; padding:14px; margin:9px 0 12px;}
-.run-progress-heading {display:flex; align-items:center; gap:11px; margin-bottom:11px;}
-.run-progress-heading b {display:block; font-size:15px; color:#242424;}
-.run-progress-heading small {display:block; margin-top:3px; font-size:12px; color:#686868;}
-.run-pulse {width:12px; height:12px; border-radius:50%; background:#242424; box-shadow:0 0 0 0 rgba(36,36,36,.25); animation:rsmem-pulse 1.35s infinite; flex:none;}
-@keyframes rsmem-pulse {0%{box-shadow:0 0 0 0 rgba(36,36,36,.28)}70%{box-shadow:0 0 0 10px rgba(36,36,36,0)}100%{box-shadow:0 0 0 0 rgba(36,36,36,0)}}
-.processing-pipeline {grid-template-columns:repeat(4,minmax(132px,1fr)) !important; margin-bottom:0 !important;}
-.pipeline {display:grid; grid-template-columns:repeat(6,minmax(108px,1fr)); gap:7px; margin:10px 0 11px;}
-.stage {min-width:0; border-radius:9px; padding:9px 10px; border:1px solid #e2e2e2; background:#ffffff; color:#262626;}
-.stage span {display:inline-flex; width:20px; height:20px; border-radius:50%; align-items:center; justify-content:center; margin-right:6px; background:#ededed; color:#555555; font-size:11px;}
-.stage b {display:inline-block; font-size:12px;}
-.stage small {display:block; margin-top:5px; color:#777777; font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
-.stage.done {border-color:#d5d5d5; background:#fafafa;}
-.stage.done span, .stage.current span {background:#252525; color:#ffffff;}
-.stage.current {border-color:#999999; background:#eeeeee;}
-.stage.pending {opacity:.62;}
-.stage.skip {opacity:.42;}
-.attempts {display:flex; gap:8px; flex-wrap:wrap; margin:0 0 12px;}
-.attempt {display:flex; gap:10px; align-items:center; padding:6px 10px; border-radius:999px; border:1px solid #dddddd; background:#ffffff; font-size:11px;}
-.attempt span {color:#737373;}
-.attempt strong {font-size:10px; letter-spacing:.04em;}
-.attempt.pass strong {color:#18794e;}
-.attempt.fail strong {color:#b54735;}
-
-/* Results: single vertical flow */
-#rsmem-workspace {display:block !important; margin-top:8px;}
-.section-title h2 {font-size:17px !important; font-weight:700 !important; margin:24px 0 2px !important; letter-spacing:-.01em;}
-.section-title p {font-size:12.5px !important; color:#737373 !important; margin:0 0 10px !important;}
-.workspace-content {font-size:13px !important; line-height:1.55 !important;}
-
-/* Agent trace */
-.agent-trace {font-size:13px; line-height:1.55;}
-.agent-trace .attempt-head {font-size:14px; font-weight:700; margin:2px 0 4px;}
-.agent-trace .block-label {font-size:13px; font-weight:650; margin:14px 0 8px;}
-.agent-trace ol.plan {list-style:none; margin:0; padding:0; counter-reset:plan;}
-.agent-trace ol.plan li {counter-increment:plan; display:flex; gap:10px; padding:6px 0; border-bottom:1px dashed #eeeeee; align-items:baseline;}
-.agent-trace ol.plan li:last-child {border-bottom:0;}
-.agent-trace ol.plan li::before {content:counter(plan); flex:none; width:20px; height:20px; border-radius:50%; background:#ededed; color:#555555; font-size:11px; display:inline-flex; align-items:center; justify-content:center; position:relative; top:3px;}
-.agent-trace ol.plan code {font-family:ui-monospace,Menlo,monospace; font-size:12px; background:#f0f0f0; border-radius:4px; padding:1px 6px; white-space:nowrap;}
-.agent-trace .step-card {border:1px solid #e3e3e3; border-radius:10px; margin-bottom:8px; background:#ffffff; overflow:hidden;}
-.agent-trace .step-card summary {display:flex; align-items:center; gap:10px; padding:8px 12px; cursor:pointer; list-style:none;}
-.agent-trace .step-card summary::-webkit-details-marker {display:none;}
-.agent-trace .step-card .num {flex:none; width:20px; height:20px; border-radius:50%; background:#202020; color:#ffffff; font-size:11px; display:inline-flex; align-items:center; justify-content:center;}
-.agent-trace .step-card code {font-family:ui-monospace,Menlo,monospace; font-size:12.5px;}
-.agent-trace .badge {font-size:11px; font-weight:650; border-radius:999px; padding:2px 9px; margin-left:auto;}
-.agent-trace .badge.ok {color:#18794e; background:#e7f3ec;}
-.agent-trace .badge.err {color:#a53b2a; background:#f7e9e6;}
-.agent-trace .step-obs {border-top:1px solid #f0f0f0; background:#fafafa; padding:9px 12px; font-family:ui-monospace,Menlo,monospace; font-size:11.5px; color:#444444; white-space:pre-wrap; word-break:break-word; line-height:1.5; max-height:220px; overflow:auto;}
-.agent-trace .attempt-answer {border:1px solid #e6e6e6; border-radius:10px; background:#fbfbfb; padding:10px 14px; white-space:pre-wrap;}
-.agent-trace .trace-divider {border:0; border-top:1px solid #e3e3e3; margin:18px 0;}
-
-/* Summary card */
-#current-result {border:1px solid #e3e3e3 !important; border-left:3px solid #202020 !important; background:#fbfbfb !important; border-radius:0 10px 10px 0 !important; padding:12px 16px !important; margin-top:14px;}
-#current-result h3 {font-size:13px !important; margin:0 0 4px !important;}
-#current-result h4 {font-size:13.5px !important; margin:8px 0 4px !important;}
-
-/* Evidence */
-#evaluation-card {background:#ffffff !important; border:1px solid #e3e3e3 !important; border-radius:10px !important; padding:12px 14px !important; margin-top:10px;}
-#evaluation-card h3 {font-size:13.5px !important; margin-top:0 !important;}
-
-/* Decision bar */
-#decision-panel {border:1px solid #d4d4d4 !important; border-radius:12px !important; background:#ffffff !important; padding:14px 18px !important; margin-top:16px !important;}
-#decision-panel h3 {margin:0 0 4px !important; color:#242424 !important; font-size:14px !important;}
-#accept-result-button {font-weight:700 !important; background:#202020 !important; color:#ffffff !important;}
-#retry-result-button {font-weight:700 !important; background:#ffffff !important; color:#a53b2a !important; border:1px solid #ddb4ab !important;}
-
-/* Reflection */
-#reflection-panel {background:#ffffff !important; border:1px solid #d7d7d7 !important; border-radius:12px !important; padding:16px 18px !important; margin-top:14px;}
-#reflection-panel h3 {font-size:15px !important; margin-top:0 !important;}
-
-footer {visibility:hidden; height:0;}
-
-@media (max-width:900px) {
-  .pipeline {grid-template-columns:repeat(4,minmax(100px,1fr));}
-}
-@media (max-width:720px) {
-  .gradio-container > .main {padding:0 12px 24px !important;}
-  .hero {display:block; text-align:center;}
-  .hero p {margin-top:5px !important;}
-  .pipeline {grid-template-columns:repeat(2,minmax(0,1fr));}
-  .processing-pipeline {grid-template-columns:repeat(2,minmax(0,1fr)) !important;}
-  #run-rsmem-button {flex:1 1 100% !important;}
-  #connection-mode .wrap {flex-wrap:wrap !important;}
-  #connection-mode label {flex:1 1 100%;}
-  #connection-mode label + label {border-left:0 !important; border-top:1px solid #d4d4d4 !important;}
-}
-"""
-
 
 with gr.Blocks(title=PROJECT_TITLE) as demo:
-    gr.HTML(
-        "<div class='hero'><h1>🛰️ RSMeM — A real end-to-end Earth observation agent</h1></div>"
-    )
+    gr.HTML(NAV, js_on_load=language_script(), apply_default_css=False, elem_classes=["rsmem-localized"])
 
     with gr.Tab("Run RSMeM"):
         session_state = gr.State({})
         browser_session = gr.BrowserState("", storage_key="rsmem_session")
+        gr.HTML(hero_html(), elem_id="studio-intro", apply_default_css=False, elem_classes=["rsmem-localized"])
+        gr.HTML(walkthrough_html(), js_on_load=WALKTHROUGH_JS, elem_id="studio-walkthrough", apply_default_css=False, elem_classes=["rsmem-localized"])
+        gr.HTML(WORKSPACE_HEADING, apply_default_css=False, elem_classes=["rsmem-localized"])
 
         with gr.Group(elem_id="input-card"):
             gr.Markdown(
-                "### What do you want RSMeM to analyze?",
+                "### 01 / Ask your question",
                 elem_classes=["card-heading"],
             )
             query_input = gr.Textbox(
                 label="Query",
+                show_label=False,
                 value="",
-                placeholder=(
-                    "Example: compare the mean nighttime-light intensity of the two "
-                    "attached GeoTIFFs, identify the lower month, and report the "
-                    "absolute difference. Mention your bands or dates and the exact "
-                    "result you want."
-                ),
-                lines=5,
+                placeholder="Type your remote-sensing question…",
+                lines=3,
+                elem_id="query-input",
             )
+            with gr.Accordion(
+                f"Need an idea? Explore {len(EXAMPLES) - 1} prepared cases",
+                open=False,
+                elem_id="example-picker",
+            ):
+                gr.Markdown("Examples are optional. Choosing one fills the query and loads its imagery.")
+                with gr.Row(elem_id="quick-cases"):
+                    quick_drought = gr.Button("Sichuan · Drought", size="sm")
+                    quick_lights = gr.Button("Bhutan · Night lights", size="sm")
+                    quick_fire = gr.Button("California · Burn trend", size="sm")
+                example_input = gr.Dropdown(
+                    label="Prepared remote-sensing case",
+                    choices=[name for name, item in EXAMPLES.items() if item["directory"]],
+                    value=None,
+                    info="Selecting a case replaces uploaded files. You can still edit the question.",
+                )
             with gr.Row(elem_id="attach-row"):
                 with gr.Column(scale=6, min_width=280):
                     gr.Markdown(
-                        "**Attach your imagery** · GeoTIFF, TIFF, PNG, or JPEG · multiple files "
-                        "and multiband rasters supported",
+                        "**Your imagery**\n\n"
+                        "GeoTIFF / TIFF / PNG / JPEG · multiple files",
                         elem_classes=["upload-heading"],
                     )
                     raster_input = gr.File(
@@ -2485,12 +2375,12 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
                         file_types=[".tif", ".tiff", ".png", ".jpg", ".jpeg"],
                         type="filepath",
                         elem_id="raster-upload",
-                        height=170,
+                        height=240,
                     )
                 with gr.Column(scale=6, min_width=280):
                     gr.Markdown(
-                        "**Preview** · contrast-stretched for display; RSMeM executes "
-                        "on the original values",
+                        "**Input preview**\n\n"
+                        "First image · fitted to the window without changing its proportions.",
                         elem_classes=["upload-heading"],
                     )
                     raster_preview_output = gr.Image(
@@ -2499,35 +2389,48 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
                         interactive=False,
                         show_label=False,
                         elem_id="raster-preview",
-                        height=200,
+                        height=240,
+                        buttons=["fullscreen"],
                     )
-            with gr.Accordion(
-                f"Need inspiration? Load one of {len(EXAMPLES) - 1} prepared cases",
-                open=False,
-                elem_id="example-picker",
-            ):
-                example_input = gr.Dropdown(
-                    label="Prepared remote-sensing case",
-                    choices=[name for name, item in EXAMPLES.items() if item["directory"]],
-                    value=None,
-                    info="This fills the query and loads bundled GeoTIFFs; the query remains editable.",
-                )
-        example_input.change(
-            load_example,
+            gr.Markdown(
+                "PNG / JPEG require compatible perception tools. Analysis uses the original pixel values.",
+                elem_id="imagery-help",
+            )
+        example_input.input(
+            load_example_for_ui,
             inputs=[example_input],
-            outputs=[query_input, raster_preview_output],
+            outputs=[query_input, raster_preview_output, raster_input],
         )
-        raster_input.change(
-            preview_uploaded_rasters,
-            inputs=[raster_input],
-            outputs=[raster_preview_output],
+        raster_input.upload(
+            select_uploaded_source,
+            inputs=[raster_input, example_input],
+            outputs=[raster_preview_output, example_input],
         )
+        raster_input.clear(
+            select_uploaded_source,
+            inputs=[raster_input, example_input],
+            outputs=[raster_preview_output, example_input],
+        )
+        raster_input.delete(
+            select_uploaded_source,
+            inputs=[raster_input, example_input],
+            outputs=[raster_preview_output, example_input],
+        )
+        for quick_button, directory in (
+            (quick_drought, "tvdi_sichuan"),
+            (quick_lights, "nightlights_bhutan"),
+            (quick_fire, "nbr_california"),
+        ):
+            case_name = next(name for name, case in EXAMPLES.items() if case["directory"] == directory)
+            quick_button.click(
+                lambda selected=case_name: load_quick_case(selected),
+                outputs=[example_input, query_input, raster_preview_output, raster_input],
+            )
 
         with gr.Group(elem_id="model-service"):
             gr.Markdown(
-                "### Model service — required to run\n"
-                "Choose how RSMeM calls the planner model. Credentials live in this "
-                "browser session only and are never stored by the Studio.",
+                "### 02 / Connect a model\n"
+                "Use your ModelScope quota or your own API. Credentials stay in the current session and are never written to project files.",
                 elem_classes=["card-heading"],
             )
             connection_mode = gr.Radio(
@@ -2537,7 +2440,7 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
                 elem_id="connection-mode",
             )
             with gr.Column(visible=True, elem_id="ms-pane") as ms_pane:
-                ms_status = gr.HTML()
+                ms_status = gr.HTML(elem_classes=["rsmem-localized"])
                 with gr.Row():
                     refresh_ms_button = gr.Button(
                         "Refresh sign-in status", size="sm", elem_id="ms-refresh"
@@ -2575,12 +2478,12 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
 
         with gr.Row(elem_id="run-row"):
             run_button = gr.Button(
-                "Analyze with RSMeM", variant="primary", elem_id="run-rsmem-button"
+                "Analyze with RSMeM   ↗", variant="primary", elem_id="run-rsmem-button"
             )
 
         api_status = gr.Markdown(
-            "⚪ Ready. Sign in with ModelScope or enter an API key — nothing runs "
-            "without your own model authorization.",
+            '<span class="rsmem-localized">Choose data and connect a model to begin. Live progress, your answer, and available downloads will appear below. '
+            'Your model authorization is required.</span>',
             elem_id="workflow-status",
         )
         timeline_output = gr.HTML(elem_id="workflow-timeline")
@@ -2597,23 +2500,23 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
             )
 
             gr.Markdown(
-                "## Agent trace",
+                "## Agent trace\nOpen a tool call to inspect its inputs, observations, or errors.",
                 elem_classes=["section-title"],
             )
             attempts_output = gr.HTML(elem_id="agent-trace-body")
 
             gr.Markdown(
-                "## Evidence & artifacts\nRetrieved knowledge and generated files.",
+                "## Evidence & artifacts\nExplore the retrieved knowledge and download files created by this run.",
                 elem_classes=["section-title"],
             )
-            with gr.Accordion("Retrieved knowledge", open=True) as hkg_accordion:
+            with gr.Accordion("Retrieved knowledge", open=False) as hkg_accordion:
                 hkg_output = gr.Markdown(elem_classes=["workspace-content"])
             evaluation_output = gr.Markdown(visible=False, elem_id="evaluation-card")
             with gr.Accordion("Generated files", open=True):
                 artifact_output = gr.File(
                     label="Download generated artifacts", file_count="multiple"
                 )
-            with gr.Accordion("Debug trace", open=True):
+            with gr.Accordion("Debug trace", open=False):
                 gr.Markdown(
                     "Stage-by-stage log of this run — knowledge scores, planned tools, "
                     "real tool observations, model verdicts, and full tracebacks on "
@@ -2781,6 +2684,7 @@ with gr.Blocks(title=PROJECT_TITLE) as demo:
             ],
             outputs=workflow_outputs,
         )
+        gr.HTML(FOOTER, apply_default_css=False, elem_classes=["rsmem-localized"])
 
     with gr.Tab("Open-source resources"):
         learn_resource = (
@@ -2833,6 +2737,21 @@ If RSMeM supports your research, please cite the arXiv paper:
 {PROJECT_ABSTRACT}
             """
         )
+
+
+    # Localize interface labels and static copy, never live model answers or evidence.
+    # The browser translator also skips input/textarea values and file-name cells.
+    _live_markdown_ids = {
+        component._id for component in (
+            api_status, final_output, hkg_output, evaluation_output, decision_output
+        )
+    }
+    for _component in demo.blocks.values():
+        if isinstance(_component, gr.Accordion):
+            _component.elem_classes.append("rsmem-localized-label")
+        elif isinstance(_component, (gr.Markdown, gr.Textbox, gr.Button, gr.Radio, gr.Dropdown, gr.File, gr.Image)):
+            if _component._id not in _live_markdown_ids:
+                _component.elem_classes.append("rsmem-localized")
 
 
 def _oauth_page(title: str, body: str) -> str:
@@ -2985,7 +2904,9 @@ def create_app():
 
     demo.queue()
     gr.mount_gradio_app(
-        fastapi_app, demo, path="/", theme=gr.themes.Soft(), css=CSS
+        fastapi_app, demo, path="/",
+        theme=gr.themes.Base(primary_hue="blue", neutral_hue="slate"), css=CSS,
+        i18n=gr.I18n(**{locale: ENGLISH_CONTROLS for locale in ("en", "zh", "zh-CN", "zh-TW")}),
     )
     return fastapi_app
 
