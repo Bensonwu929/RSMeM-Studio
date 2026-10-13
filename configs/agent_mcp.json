@@ -1,0 +1,32 @@
+{
+  "mcpServers": {
+    "Analysis": {
+      "command": "python",
+      "args": ["tools/Analysis.py", "--temp_dir", "tmp/tmp/out"]
+    },
+    "Index": {
+      "command": "python",
+      "args": ["tools/Index.py", "--temp_dir", "tmp/tmp/out"]
+    },
+    "Inversion": {
+      "command": "python",
+      "args": ["tools/Inversion.py", "--temp_dir", "tmp/tmp/out"]
+    },
+    "Perception": {
+      "command": "python",
+      "args": ["tools/Perception.py", "--temp_dir", "tmp/tmp/out"]
+    },
+    "OEA_Perception": {
+      "command": "python",
+      "args": ["tools/OEA_Perception.py", "--controller-url", "http://127.0.0.1:21001"]
+    },
+    "Statistics": {
+      "command": "python",
+      "args": ["tools/Statistics.py", "--temp_dir", "tmp/tmp/out"]
+    },
+    "CodeExec": {
+      "command": "python",
+      "args": ["tools/CodeExec.py", "--temp_dir", "tmp/tmp/out"]
+    }
+  }
+}

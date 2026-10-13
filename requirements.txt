@@ -1,0 +1,14 @@
+gradio==6.17.3
+openai>=1.99,<3
+numpy>=1.26,<2
+rasterio>=1.4,<2
+pillow>=10,<13
+matplotlib>=3.8,<4
+requests>=2.32,<3
+fastmcp==2.11.3
+mcp==1.12.4
+modelscope>=1.37
+langchain>=1.2,<2
+langchain-openai>=1.1,<2
+langgraph>=1.0,<2
+langgraph-checkpoint-sqlite==2.0.11

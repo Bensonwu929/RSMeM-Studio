@@ -1,0 +1,13 @@
+ms_deploy.json
+.DS_Store
+__pycache__/
+*.pyc
+models/
+gpu-logs/
+*.pth
+*.pt
+*.safetensors
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+/docs/NEXT_AGENT_HANDOFF.md
