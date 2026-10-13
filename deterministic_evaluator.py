@@ -98,10 +98,6 @@ CONTRACTS: dict[str, CaseContract] = {
         numbers=(NumericExpectation(53198, 3),),
         text_groups=(("west",),),
     ),
-    "q180_thailand_frp": CaseContract(
-        numbers=(NumericExpectation(115, 2),),
-        text_groups=(("upper quartile", "75th", "75 percent"),),
-    ),
     "q187_shanghai_volume": CaseContract(
         numbers=(NumericExpectation(149.76, 4.0),),
         text_groups=(("increasing", "positive"),),

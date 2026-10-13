@@ -145,9 +145,36 @@ class InteractiveWorkflowTests(unittest.TestCase):
             self.assertIn("—", name)
             self.assertGreater(len(name), 55)
 
-    def test_reference_catalog_covers_every_builtin_case(self):
-        directories = {case["directory"] for case in app.EXAMPLES.values() if case["directory"]}
-        self.assertEqual(directories, set(app.CASE_REFERENCES))
+    def test_reference_catalog_covers_every_graded_builtin_case(self):
+        graded = {
+            case["directory"] for case in app.EXAMPLES.values()
+            if case["directory"] and not case.get("freeform")
+        }
+        self.assertEqual(graded, set(app.CASE_REFERENCES))
+
+    def test_open_ended_cases_bundle_images_with_pre_before_post(self):
+        freeform = [case for case in app.EXAMPLES.values() if case.get("freeform")]
+        self.assertEqual(len(freeform), 15)
+        for case in freeform:
+            self.assertNotIn(case["directory"], app.CASE_REFERENCES)
+            names = [path.name for path in app._bundled_files(app.ROOT / "examples" / case["directory"])]
+            self.assertTrue(names, case["directory"])
+            for index, name in enumerate(names):
+                if "post" in name:
+                    self.assertIn("pre", names[index - 1], case["directory"])
+
+    def test_open_ended_case_runs_like_an_upload_without_a_reference(self):
+        name = next(name for name, case in app.EXAMPLES.items() if case.get("freeform"))
+        with patch.object(app, "api_completion", StudioApi()):
+            state = app.start_interactive_workflow(
+                app.EXAMPLES[name]["query"], name, [],
+                "https://example.com/v1", "test-model", "private-test-key",
+            )[0]
+        self.assertEqual(state["mode"], "custom")
+        self.assertEqual(state["max_attempts"], 10)
+        self.assertIsNone(state.get("reference"))
+        self.assertTrue(all(path.endswith(".png") for path in state["raster_paths"]))
+        self.assertIn("open-ended bundled case", app._render_interactive_state(state)[0])
 
     def test_raster_preview_is_display_ready_and_keeps_source_unchanged(self):
         before = self.one_tif.stat().st_mtime_ns

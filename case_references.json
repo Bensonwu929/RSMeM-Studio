@@ -43,10 +43,6 @@
     "reference": "Eleven NBR dates are thresholded at NBR below -0.3. The combined hotspot mask contains 53198 active pixels and its dominant image-frame direction is west.",
     "rubric": "Require low-NBR hotspot masks and report west as the dominant direction."
   },
-  "q180_thailand_frp": {
-    "reference": "A maximum composite is produced from 30 daily MaxFRP rasters. Fire-prone pixels are the upper quartile of positive values, using a threshold of 115 in the bundled data.",
-    "rubric": "Require a 30-day maximum composite and the positive-pixel 75th-percentile threshold of approximately 115."
-  },
   "q187_shanghai_volume": {
     "reference": "Eight residential-volume maps are derived as total minus non-residential volume for 1985–2020. Their regional means show an increasing trend with fitted slope approximately 149.76 volume units per year.",
     "rubric": "Require year-paired subtraction, eight derived maps, and an increasing trend close to 149.76 per year."

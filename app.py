@@ -193,15 +193,101 @@ EXAMPLES = {
         "query": "Calculate California NBR from January to March 2025, identify fire hotspots where NBR is below -0.3, and determine their dominant general direction.",
         "description": "22 GeoTIFFs · paired NIR/SWIR → NBR → low-NBR masks → hotspot direction",
     },
-    "🚒 Thailand fire-risk mapping — derive an August MaxFRP hotspot mask": {
-        "directory": "q180_thailand_frp",
-        "query": "Combine Thailand daily MaxFRP rasters for August 2018 and map the most fire-prone areas using the upper quartile of positive fire radiative power.",
-        "description": "30 GeoTIFFs · MaxFRP maximum composite → positive-pixel percentile → fire-prone area",
-    },
     "🏙️ Shanghai residential development — derive and trend building volume": {
         "directory": "q187_shanghai_volume",
         "query": "Derive Shanghai residential building volume as total minus non-residential volume for 1985–2020, then estimate its long-term linear trend.",
         "description": "16 GeoTIFFs · year-paired subtraction → residential-volume maps → regional means → trend",
+    },
+    # Open-ended perception cases: no reference answer, so they run like an upload.
+    "🏚️ Wildfire building loss — segment buildings before and after the fire and total the lost area": {
+        "directory": "oea_change_building_loss",
+        "freeform": True,
+        "query": "These satellite images show the same area before (01_pre_disaster.png) and after (02_post_disaster.png) a wildfire. Detect and segment the buildings in both images, identify where buildings disappeared or shrank, and report the total reduction in building area in pixels.",
+        "description": "2 PNGs · pre/post building segmentation → lost building area",
+    },
+    "🏚️ Two-region wildfire triage — decide which area suffered the heavier building damage": {
+        "directory": "oea_change_region_triage",
+        "freeform": True,
+        "query": "Region A and region B were both hit by a wildfire, and each has a pre-event and a post-event image. Compare the building damage in each region and determine which area suffered the more severe impact.",
+        "description": "4 PNGs · two pre/post pairs → per-region building damage → comparison",
+    },
+    "🏘️ District damage comparison — quantify building-area loss in two burned districts": {
+        "directory": "oea_change_urban_loss",
+        "freeform": True,
+        "query": "A wildfire struck two urban areas, region A and region B. Using the pre- and post-event images of each region, detect and segment the buildings, calculate the reduction in total building area for each region, and identify which region experienced the greater loss.",
+        "description": "4 PNGs · building segmentation per date → area reduction per region → larger loss",
+    },
+    "🚑 Relief prioritization — rank two fire-hit neighbourhoods by destroyed building area": {
+        "directory": "oea_change_relief_rank",
+        "freeform": True,
+        "query": "A wildfire struck two neighbouring areas, region A and region B, and responders must prioritise relief. Using the pre- and post-event images of both regions, detect the buildings at each time point, identify buildings that were destroyed or significantly damaged, calculate the reduction in building area for each region, and determine which region was more severely affected.",
+        "description": "4 PNGs · destroyed-building detection → area reduction → relief priority",
+    },
+    "🔥 Santa Rosa wildfire damage — count buildings destroyed between pre- and post-fire images": {
+        "directory": "oea_p_santarosa_change",
+        "freeform": True,
+        "query": "How many buildings destroyed in the post image compared to pre image?",
+        "description": "2 PNGs · pre/post change detection → destroyed-building count",
+    },
+    "🧱 Collapsed-building survey — separate fully and partially destroyed buildings and give the ratio": {
+        "directory": "oea_p_collapse_ratio",
+        "freeform": True,
+        "query": "Identify the destroyed building and estimate the ratio of partially destroyed and fully destroyed",
+        "description": "1 JPEG · damaged-building grounding → collapse attribute → ratio",
+    },
+    "🌊 Flood impact summary — describe the flooded scene and count the affected houses and cars": {
+        "directory": "oea_p_flood_summary",
+        "freeform": True,
+        "query": "Describe the situation by sharing number of houses and cars in the flood.",
+        "description": "1 JPEG · scene captioning → house and vehicle counts",
+    },
+    "🌉 Highway corridor inventory — count the human-made structures besides roads and vehicles": {
+        "directory": "oea_p_structures_highway",
+        "freeform": True,
+        "query": "Count and list the human-made structures other than the roads and the vehicle?",
+        "description": "1 JPEG · open-vocabulary detection → structure inventory",
+    },
+    "🅿️ Parking-lot occupancy — count the cars parked in the top-left lot of the scene": {
+        "directory": "oea_p_parking_count",
+        "freeform": True,
+        "query": "how many cars are parked in parking lot at top left",
+        "description": "1 PNG · region grounding → vehicle count",
+    },
+    "🛬 Runway identification — read the runway number and check whether any aircraft sit on it": {
+        "directory": "oea_p_runway_ocr",
+        "freeform": True,
+        "query": "Extract the visible runway number, and determine planes present on that runway.",
+        "description": "1 PNG · OCR → runway localization → aircraft count",
+    },
+    "🎾 Occluded parking survey — judge visibility south of the tennis courts and count vehicles": {
+        "directory": "oea_p_tennis_parking",
+        "freeform": True,
+        "query": "Is the parking area south of tennis courts fully visible or partially occluded in the given imagery, and can you provide a count of the parked vehicles present within the visible area?",
+        "description": "1 PNG · grounding → occlusion attribute → vehicle count",
+    },
+    "🚢 Harbour vessel alignment — decide whether every ship in the scene faces the same way": {
+        "directory": "oea_p_ship_heading",
+        "freeform": True,
+        "query": "Are all ships facing the same direction?",
+        "description": "1 JPEG · ship grounding → per-ship heading attribute",
+    },
+    "✈️ Terminal apron activity — count aircraft at the terminal and those docked at jet bridges": {
+        "directory": "oea_p_terminal_aircraft",
+        "freeform": True,
+        "query": "How many aircraft are currently positioned near the main terminal building, and of those, how many are connected to a jet bridge?",
+        "description": "1 PNG · terminal grounding → aircraft count → jet-bridge attribute",
+    },
+    "🏟️ Turf lettering survey — read the field markings and estimate their bearing from north": {
+        "directory": "oea_p_turf_ocr_bearing",
+        "freeform": True,
+        "query": "What is the exact wording, and orientation (degree from north) of the large field markings painted on the turf inside the central track?",
+        "description": "1 JPEG · OCR → marking orientation",
+    },
+    "🏊 Residential pool condition — locate each swimming pool and rate its maintenance state": {
+        "directory": "oea_p_pool_condition",
+        "freeform": True,
+        "query": "Can you rate the condition of the swimming pools in this residential area?",
+        "description": "1 JPEG · pool grounding → per-pool condition attribute",
     },
     "📤 Custom GeoTIFF upload": {
         "directory": None,
@@ -636,12 +722,22 @@ def preview_uploaded_rasters(uploaded_files):
     return raster_preview(uploaded_files)
 
 
+BUNDLED_IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+
+
+def _bundled_files(directory: Path) -> list[Path]:
+    return sorted(
+        path for path in directory.iterdir()
+        if path.suffix.lower() in BUNDLED_IMAGE_SUFFIXES and path.is_file()
+    )
+
+
 def load_example(example_name: str):
     if not example_name:
         return ("", None)
     example = EXAMPLES.get(example_name, EXAMPLES[DEFAULT_EXAMPLE])
     directory = ROOT / "examples" / example["directory"] if example["directory"] else None
-    paths = sorted(directory.glob("*.tif")) if directory and directory.is_dir() else []
+    paths = _bundled_files(directory) if directory and directory.is_dir() else []
     return (example["query"], raster_preview(paths))
 
 
@@ -655,7 +751,7 @@ def _bundled_raster_paths(example_name: str) -> list[str]:
     folder = ROOT / "examples" / directory
     if not folder.is_dir():
         return []
-    return sorted(str(path.resolve()) for path in folder.glob("*.tif"))
+    return [str(path.resolve()) for path in _bundled_files(folder)]
 
 
 def _hidden_case_row():
@@ -766,7 +862,7 @@ def prepare_rasters(uploaded_files, run_dir: Path, example_name: str) -> tuple[l
     example = EXAMPLES.get(example_name, EXAMPLES[DEFAULT_EXAMPLE])
     if example["directory"]:
         directory = ROOT / "examples" / example["directory"]
-        bundled = sorted(str(path.resolve()) for path in directory.glob("*.tif"))
+        bundled = [str(path.resolve()) for path in _bundled_files(directory)]
         if bundled:
             return bundled, f"bundled remote-sensing case: {example_name}"
     raise gr.Error("Custom mode requires at least one .tif, .tiff, .png, .jpg, or .jpeg image.")
@@ -1905,7 +2001,7 @@ def _initialize_interactive_workflow(
     run_id = datetime.now(timezone.utc).strftime("%H%M%S") + "-" + secrets.token_hex(4)
     archive_dir = run_storage.new_run_dir(run_id)
     raster_paths = run_storage.archive_inputs(archive_dir, raster_paths)
-    custom = bool(uploaded_files) or example["directory"] is None
+    custom = bool(uploaded_files) or example["directory"] is None or example.get("freeform", False)
     hkg_md, hkg_context, retrieved = _retrieve_for_session(query)
     reference = None if custom else CASE_REFERENCES[example["directory"]]
     state = {
@@ -2237,7 +2333,12 @@ def _evaluation_summary_markdown(evaluation: dict, mode: str) -> str:
 
 def _render_interactive_state(state: dict):
     status = state.get("status", "not_started")
-    mode_label = "reference-aware built-in case" if state.get("mode") == "case" else "user-controlled upload"
+    if state.get("mode") == "case":
+        mode_label = "reference-aware built-in case"
+    elif str(state.get("data_source", "")).startswith("bundled"):
+        mode_label = "open-ended bundled case"
+    else:
+        mode_label = "user-controlled upload"
     status_md = (
         f"### Workflow status: `{status}`\n\n"
         f"Mode: **{mode_label}** · Attempt {len(state.get('attempts', []))}/{state.get('max_attempts', '?')} · "
@@ -2625,7 +2726,7 @@ with gr.Blocks(title=PROJECT_TITLE, delete_cache=(3600, 21600)) as demo:
     with gr.Tab("Run RSMeM"):
         session_state = gr.State({})
         browser_session = gr.BrowserState("", storage_key="rsmem_session")
-        gr.HTML(hero_html(), elem_id="studio-intro", apply_default_css=False, elem_classes=["rsmem-localized"])
+        gr.HTML(hero_html(len(EXAMPLES) - 1), elem_id="studio-intro", apply_default_css=False, elem_classes=["rsmem-localized"])
         gr.HTML(walkthrough_html(), js_on_load=WALKTHROUGH_JS, elem_id="studio-walkthrough", apply_default_css=False, elem_classes=["rsmem-localized"])
         gr.HTML(WORKSPACE_HEADING, apply_default_css=False, elem_classes=["rsmem-localized"])
 

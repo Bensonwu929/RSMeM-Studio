@@ -25,8 +25,15 @@ def test_query_precedes_optional_cases_in_the_rendered_layout():
         choice[0] if isinstance(choice, (list, tuple)) else choice
         for choice in cases["props"]["choices"]
     ]
-    assert len(choices) == 13
+    assert len(choices) == 27
     assert cases["props"].get("value") is None
+    assert f"Explore {len(choices)} prepared cases" in picker["props"]["label"]
+
+
+def test_every_case_name_and_picker_label_is_translated():
+    case_names = [name for name, case in app.EXAMPLES.items() if case["directory"]]
+    assert not [name for name in case_names if name not in TRANSLATIONS]
+    assert f"Need an idea? Explore {len(case_names)} prepared cases" in TRANSLATIONS
 
 
 def test_live_answers_and_evidence_are_not_translation_scopes():
@@ -57,6 +64,16 @@ class CopyCollector(HTMLParser):
 
 def test_hero_and_walkthrough_have_translations_for_all_explanatory_copy():
     collector = CopyCollector()
-    collector.feed(hero_html() + walkthrough_html())
+    collector.feed(hero_html(27) + walkthrough_html())
     untranslated = set(collector.copy) - TRANSLATIONS.keys() - {"NDVI", "LST", "2021.07.29 · NDVI"}
     assert not untranslated
+
+
+def test_hero_lists_task_families_and_domains_instead_of_method_pillars():
+    hero = hero_html(27)
+    assert "principle-strip" not in hero
+    assert "01 / 27" in hero
+    for copy in ("Image interpretation", "Quantitative parameter estimation", "Change detection",
+                 "Soil moisture", "Wildfires", "Urban and Infrastructure"):
+        assert copy in hero
+    assert "Earthquakes" not in hero

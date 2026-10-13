@@ -58,7 +58,63 @@ NAV = f"""
 """
 
 
-def hero_html() -> str:
+INTERPRETATION_TASKS = (
+    "Object detection",
+    "Object counting",
+    "Instance segmentation",
+    "Scene classification",
+    "Change detection",
+    "Damage assessment",
+    "Thematic extraction",
+    "Captioning and visual QA",
+    "Text recognition",
+)
+QUANTITATIVE_TASKS = (
+    "Land surface temperature",
+    "Thermal inertia",
+    "Soil moisture",
+    "Vegetation water content and LAI",
+    "Sea-ice concentration",
+    "Water turbidity",
+    "Vegetation cover",
+    "Precipitable water vapour",
+    "Spectral indices",
+    "Spatiotemporal change analysis",
+)
+# NASA Earthdata categories in NASA's order, then the one domain NASA lacks.
+APPLICATION_DOMAINS = (
+    "Agriculture",
+    "Atmospheric/Ocean Indicators",
+    "Cryospheric Indicators",
+    "Droughts",
+    "Ecosystems",
+    "Energy Production/Use",
+    "Floods",
+    "Habitat Conversion/Fragmentation",
+    "Heat",
+    "Water Quality",
+    "Wildfires",
+    "Urban and Infrastructure",
+)
+
+
+def _capability_strip() -> str:
+    def chips(items):
+        return "".join(f"<span>{item}</span>" for item in items)
+
+    domains = "".join(f'<span class="domain">{item}</span>' for item in APPLICATION_DOMAINS)
+    return f"""
+<div class="capability-strip" aria-label="Supported tasks and domains">
+  <div class="capability-columns">
+    <div><span class="principle-index">01 / IMAGE INTERPRETATION</span><strong>Image interpretation</strong><span class="capability-body">Identify what is on the ground, where it is, and where its boundary runs.</span><div class="capability-chips">{chips(INTERPRETATION_TASKS)}</div></div>
+    <div><span class="principle-index">02 / QUANTITATIVE ESTIMATION</span><strong>Quantitative parameter estimation</strong><span class="capability-body">Retrieve values with physical meaning, and track how they change over space and time.</span><div class="capability-chips">{chips(QUANTITATIVE_TASKS)}</div></div>
+  </div>
+  <div class="domain-row"><span class="principle-index">APPLIED TO</span>{domains}</div>
+</div>
+"""
+
+
+def hero_html(case_count: int) -> str:
     return f"""
 <section class="studio-hero" aria-labelledby="hero-title">
   <div class="hero-copy">
@@ -69,18 +125,13 @@ def hero_html() -> str:
   </div>
   <div class="earth-observation" aria-label="False-color preview of real Black Forest NDVI example data">
     <div class="observation-grid"></div>
-    <div class="scene-heading"><span><i class="signal-dot"></i> OBSERVATION FIELD</span><span>01 / 13</span></div>
+    <div class="scene-heading"><span><i class="signal-dot"></i> OBSERVATION FIELD</span><span>01 / {case_count:02d}</span></div>
     <div class="raster-plane"><img src="{_image('blackforest-ndvi.webp')}" alt="Black Forest NDVI raster in blue-green display colors" /><span class="scan-line" aria-hidden="true"></span><span class="map-crosshair" aria-hidden="true">+</span></div>
     <div class="scene-coordinate">BLACK FOREST<br><span>2021.07.29 · NDVI</span></div>
     <div class="scene-caption"><span class="scene-icon">◫</span><span>Every insight starts with an observation.</span><span class="scene-arrow">↗</span></div>
   </div>
 </section>
-<div class="principle-strip" aria-label="Three foundations of RSMeM">
-  <div><span class="principle-index">01 / KNOWLEDGE</span><strong>Plan with domain knowledge</strong><span>HKG · Hierarchical Knowledge Grounding</span></div>
-  <div><span class="principle-index">02 / EVIDENCE</span><strong>Follow the evidence</strong><span>Real tools, visible steps, downloadable outputs</span></div>
-  <div><span class="principle-index">03 / MEMORY</span><strong>Learn from each attempt</strong><span>FAR · Failure-Aware Experience Refinement</span></div>
-</div>
-"""
+{_capability_strip()}"""
 
 
 def walkthrough_html() -> str:
@@ -135,7 +186,7 @@ def walkthrough_html() -> str:
         <p class="demo-kicker">MEMORY / A BETTER NEXT ATTEMPT</p><h3>Turn a failed attempt into useful experience.</h3>
         <div class="memory-loop"><span>Find the issue</span><b>→</b><span>Compare repairs</span><b>→</b><strong>You confirm</strong><div>↳ Save confirmed memory → Retry with new constraints ↗</div></div>
         <div class="demo-outcome"><span>YOUR NEXT STEP</span><p>Accept an upload result or request a repair. Compare three suggestions or write your own. Only the reflection you confirm enters the next attempt.</p></div>
-        <p class="demo-note">HKG supplies prior knowledge. FAR refines failure experience. Up to 3 attempts per case, or 10 for uploads.</p>
+        <p class="demo-note">HKG supplies prior knowledge. FAR refines failure experience. Up to 3 attempts for graded cases, or 10 for uploads and open-ended cases.</p>
       </div>
       <div class="route-controls"><button type="button" data-route-prev aria-label="Previous step" disabled>←</button><span>Pixels → Answers → Experience</span><button type="button" data-route-next aria-label="Next step">Next step →</button></div>
     </div>
