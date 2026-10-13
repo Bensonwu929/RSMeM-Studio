@@ -2892,12 +2892,14 @@ with gr.Blocks(title=PROJECT_TITLE, delete_cache=(3600, 21600)) as demo:
                     base_url_input = gr.Textbox(
                         label="OpenAI-compatible Base URL",
                         value=DEFAULT_BASE_URL,
+                        max_lines=1,
                         placeholder="https://provider.example/v1",
                         info="Only public HTTPS endpoints are accepted.",
                     )
                     model_input = gr.Textbox(
                         label="Model",
                         value=DEFAULT_MODEL,
+                        max_lines=1,
                         placeholder="Provider model identifier",
                         info="Use the exact model identifier exposed by your provider.",
                     )
