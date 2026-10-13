@@ -94,6 +94,7 @@ body {margin:0; background:#080f1b; overflow-x:clip;}
 .scene-icon {font-size:25px; color:#94c5e2;}
 .scene-arrow {margin-left:auto; font-size:23px;}
 .capability-strip {padding:30px 0; border-top:1px solid #2a3a4f; border-bottom:1px solid #2a3a4f;}
+.capability-strip .capability-heading {margin:0 0 22px !important;}
 .capability-columns {display:grid; grid-template-columns:1fr 1fr; gap:28px;}
 .capability-columns > div {display:flex; flex-direction:column; gap:14px;}
 .capability-columns > div + div {border-left:1px solid #2a3a4f; padding-left:35px;}

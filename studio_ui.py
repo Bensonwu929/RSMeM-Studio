@@ -63,9 +63,9 @@ INTERPRETATION_TASKS = (
     "Object detection",
     "Instance segmentation",
     "Change detection",
+    "Damage assessment",
     "Object counting",
     "Scene classification",
-    "Damage assessment",
     "Thematic extraction",
     "Captioning and visual QA",
     "Text recognition",
@@ -98,6 +98,7 @@ def _capability_column(index: str, title: str, tasks: tuple[str, ...]) -> str:
 def _capability_strip() -> str:
     return f"""
 <div class="capability-strip" aria-label="Supported tasks">
+  <p class="eyebrow capability-heading">WHAT RSMeM CAN DO</p>
   <div class="capability-columns">
     {_capability_column("01", "Image interpretation", INTERPRETATION_TASKS)}
     {_capability_column("02", "Quantitative parameter estimation", QUANTITATIVE_TASKS)}

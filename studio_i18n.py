@@ -28,6 +28,7 @@ TRANSLATIONS: dict[str, str] = {
     "BLACK FOREST": "黑森林",
     "Every insight starts with an observation.": "每一次发现，都始于观测。",
     "Supported tasks": "支持的任务",
+    "WHAT RSMeM CAN DO": "RSMeM 能做什么",
     "Image interpretation": "影像解译",
     "Quantitative parameter estimation": "定量参数估计",
     "Object detection": "目标检测",
