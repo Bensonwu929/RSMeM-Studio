@@ -93,18 +93,17 @@ body {margin:0; background:#080f1b; overflow-x:clip;}
 .scene-caption {position:absolute; inset-inline:12px; bottom:15px; padding:15px 0; border-top:1px solid #9dc2db38; display:flex; align-items:center; gap:14px; font-size:13px; color:#d0e5f5;}
 .scene-icon {font-size:25px; color:#94c5e2;}
 .scene-arrow {margin-left:auto; font-size:23px;}
-.capability-strip {padding:28px 0 26px; border-top:1px solid #2a3a4f; border-bottom:1px solid #2a3a4f;}
+.capability-strip {padding:30px 0; border-top:1px solid #2a3a4f; border-bottom:1px solid #2a3a4f;}
 .capability-columns {display:grid; grid-template-columns:1fr 1fr; gap:28px;}
-.capability-columns > div {display:flex; flex-direction:column; gap:9px;}
+.capability-columns > div {display:flex; flex-direction:column; gap:14px;}
 .capability-columns > div + div {border-left:1px solid #2a3a4f; padding-left:35px;}
 .principle-index {font:10px ui-monospace,monospace; letter-spacing:1.8px; color:#7fa7c1;}
-.capability-columns strong {font-size:17px; font-weight:500; color:#dce9f8;}
-.capability-body {font-size:13px; line-height:1.6; color:#a7bbd3;}
-.capability-chips {display:flex; flex-wrap:wrap; gap:7px; margin-top:6px;}
-.capability-chips span {border:1px solid #33465e; background:#152337; border-radius:999px; padding:6px 13px; font-size:12.5px; color:#cfe2f5; line-height:1.3;}
-.domain-row {display:flex; flex-wrap:wrap; align-items:center; gap:7px; margin-top:24px; padding-top:22px; border-top:1px solid #223246;}
-.domain-row .principle-index {margin-right:10px;}
-.domain-row .domain {border:1px solid #2b3d53; border-radius:999px; padding:5px 12px; font-size:12px; color:#b4c8de; line-height:1.3;}
+.capability-title {display:flex; align-items:baseline; gap:12px;}
+.capability-title .principle-index {font-size:11px;}
+.capability-title strong {font-size:18px; font-weight:500; color:#dce9f8;}
+.capability-chips {display:flex; flex-wrap:wrap; gap:8px;}
+.capability-chips span {border:1px solid #33465e; background:#152337; border-radius:999px; padding:6px 14px; font-size:12.5px; color:#cfe2f5; line-height:1.3;}
+.capability-chips span.more-count {border-style:dashed; background:transparent; color:#7fa7c1;}
 .walkthrough {padding:86px 0 76px; scroll-margin-top:26px;}
 .section-heading {display:flex; align-items:flex-end; justify-content:space-between; gap:24px; margin-bottom:36px;}
 .section-heading .eyebrow {margin-bottom:13px !important;}
@@ -334,7 +333,7 @@ body {margin:0; background:#080f1b; overflow-x:clip;}
   .section-heading h2 {font-size:25px !important;}
   .route-panel {padding:24px 20px 20px; min-height:415px;}
   .route-step strong {font-size:16px;}
-  .capability-columns strong {font-size:15px;}
+  .capability-title strong {font-size:16px;}
 }
 @media (max-width:760px) {
   .nav-caption {display:none;}
@@ -359,11 +358,8 @@ body {margin:0; background:#080f1b; overflow-x:clip;}
   .capability-columns > div {padding:4px 0 18px;}
   .capability-columns > div + div {border-left:0; border-top:1px solid #29384a; padding:18px 0 4px;}
   .principle-index {font-size:11px;}
-  .capability-columns strong {font-size:14px;}
-  .capability-body {font-size:12px;}
+  .capability-title strong {font-size:15px;}
   .capability-chips span {padding:5px 11px; font-size:12px;}
-  .domain-row {margin-top:16px; padding-top:18px;}
-  .domain-row .principle-index {flex-basis:100%; margin:0 0 4px;}
   .walkthrough {padding:48px 0 40px;}
   .section-heading {display:block; margin-bottom:20px;}
   .section-heading h2 {font-size:23px !important;}

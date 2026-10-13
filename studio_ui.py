@@ -58,12 +58,13 @@ NAV = f"""
 """
 
 
+# Only the first CHIPS_SHOWN tasks get a chip; the rest are summarized as a count.
 INTERPRETATION_TASKS = (
     "Object detection",
-    "Object counting",
     "Instance segmentation",
-    "Scene classification",
     "Change detection",
+    "Object counting",
+    "Scene classification",
     "Damage assessment",
     "Thematic extraction",
     "Captioning and visual QA",
@@ -71,45 +72,36 @@ INTERPRETATION_TASKS = (
 )
 QUANTITATIVE_TASKS = (
     "Land surface temperature",
-    "Thermal inertia",
     "Soil moisture",
+    "Water turbidity",
+    "Thermal inertia",
     "Vegetation water content and LAI",
     "Sea-ice concentration",
-    "Water turbidity",
     "Vegetation cover",
     "Precipitable water vapour",
     "Spectral indices",
     "Spatiotemporal change analysis",
 )
-# NASA Earthdata categories in NASA's order, then the one domain NASA lacks.
-APPLICATION_DOMAINS = (
-    "Agriculture",
-    "Atmospheric/Ocean Indicators",
-    "Cryospheric Indicators",
-    "Droughts",
-    "Ecosystems",
-    "Energy Production/Use",
-    "Floods",
-    "Habitat Conversion/Fragmentation",
-    "Heat",
-    "Water Quality",
-    "Wildfires",
-    "Urban and Infrastructure",
-)
+CHIPS_SHOWN = 4
+
+
+def _capability_column(index: str, title: str, tasks: tuple[str, ...]) -> str:
+    chips = "".join(f"<span>{task}</span>" for task in tasks[:CHIPS_SHOWN])
+    hidden = len(tasks) - CHIPS_SHOWN
+    more = f'<span class="more-count">+{hidden} more</span>' if hidden > 0 else ""
+    return (
+        f'<div><div class="capability-title"><span class="principle-index">{index}</span>'
+        f'<strong>{title}</strong></div><div class="capability-chips">{chips}{more}</div></div>'
+    )
 
 
 def _capability_strip() -> str:
-    def chips(items):
-        return "".join(f"<span>{item}</span>" for item in items)
-
-    domains = "".join(f'<span class="domain">{item}</span>' for item in APPLICATION_DOMAINS)
     return f"""
-<div class="capability-strip" aria-label="Supported tasks and domains">
+<div class="capability-strip" aria-label="Supported tasks">
   <div class="capability-columns">
-    <div><span class="principle-index">01 / IMAGE INTERPRETATION</span><strong>Image interpretation</strong><span class="capability-body">Identify what is on the ground, where it is, and where its boundary runs.</span><div class="capability-chips">{chips(INTERPRETATION_TASKS)}</div></div>
-    <div><span class="principle-index">02 / QUANTITATIVE ESTIMATION</span><strong>Quantitative parameter estimation</strong><span class="capability-body">Retrieve values with physical meaning, and track how they change over space and time.</span><div class="capability-chips">{chips(QUANTITATIVE_TASKS)}</div></div>
+    {_capability_column("01", "Image interpretation", INTERPRETATION_TASKS)}
+    {_capability_column("02", "Quantitative parameter estimation", QUANTITATIVE_TASKS)}
   </div>
-  <div class="domain-row"><span class="principle-index">APPLIED TO</span>{domains}</div>
 </div>
 """
 

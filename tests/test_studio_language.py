@@ -74,6 +74,6 @@ def test_hero_lists_task_families_and_domains_instead_of_method_pillars():
     assert "principle-strip" not in hero
     assert "01 / 27" in hero
     for copy in ("Image interpretation", "Quantitative parameter estimation", "Change detection",
-                 "Soil moisture", "Wildfires", "Urban and Infrastructure"):
+                 "Soil moisture", "+5 more", "+6 more"):
         assert copy in hero
-    assert "Earthquakes" not in hero
+    assert "APPLIED TO" not in hero
