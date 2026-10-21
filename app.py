@@ -3181,8 +3181,8 @@ If RSMeM supports your research, please cite the arXiv paper:
 
 **Contributors**
 
-- Bingxian Wu — Lead developer
-- [Jin Bai](https://kbaijin.github.io/) — Frontend development
+- Bingxian Wu — Core contributor
+- [Jin Bai](https://kbaijin.github.io/) — Major contributor
 
 **Advisors**
 
