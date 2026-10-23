@@ -45,6 +45,15 @@ The bundled example GeoTIFFs include subsets of
 under Apache-2.0. See [DATA_LICENSE.md](DATA_LICENSE.md). Studio code is
 MIT-licensed; the example data keeps its original license.
 
+The optional GPU perception stack uses SAM 2.1 (segmentation), RemoteCLIP
+(scene classification), ChangeOS (change detection), BRIGHT/SiamCRNN (damage
+assessment), Grounding DINO and LAE-DINO (object localization and detection),
+and Qwen3-VL-8B-Instruct (visual description and counting), alongside an OCR
+worker. Their checkpoints and supporting assets come from
+[RSMeM-Perception-Models](https://modelscope.cn/models/wbx929/RSMeM-Perception-Models).
+The Studio's MIT license covers its code; third-party model weights and source
+packages are subject to their respective upstream terms.
+
 ## Citation
 
 If you find RSMeM useful in your research, please consider citing our paper:
